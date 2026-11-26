@@ -1,0 +1,21 @@
+{
+  "key.categories.mcgm": "MCGM Bridge to Garry's Mod",
+  "key.mcgm.pos1": "Set Pos 1",
+  "key.mcgm.pos2": "Set Pos 2",
+  "key.mcgm.export": "Open MCGM Export Screen",
+  "screen.mcgm.title": "MCGM - Minecraft to Garry's Mod Exporter",
+  "screen.mcgm.subtitle": "Select bounding box coordinates and export options",
+  "screen.mcgm.min_coords": "Min Coordinates (X, Y, Z)",
+  "screen.mcgm.max_coords": "Max Coordinates (X, Y, Z)",
+  "screen.mcgm.take_pos": "Take my pos",
+  "screen.mcgm.radius_32": "Radius 32 around me",
+  "screen.mcgm.map_name": "Map Name:",
+  "screen.mcgm.category": "Category:",
+  "screen.mcgm.lighting": "Minecraft ambient lighting",
+  "screen.mcgm.import_gmod": "Direct import to Garry's Mod",
+  "screen.mcgm.export_vmf": "Export Hammer VMF source",
+  "screen.mcgm.export_button": "Export to Garry's Mod",
+  "screen.mcgm.open_gui": "Open in MCGM GUI",
+  "screen.mcgm.mcgm_path": "Path to mcgm.exe:",
+  "screen.mcgm.close": "Close"
+}

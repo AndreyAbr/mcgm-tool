@@ -1,0 +1,21 @@
+{
+  "key.categories.mcgm": "MCGM Bridge в Garry's Mod",
+  "key.mcgm.pos1": "Установить точку 1",
+  "key.mcgm.pos2": "Установить точку 2",
+  "key.mcgm.export": "Открыть окно экспорта MCGM",
+  "screen.mcgm.title": "MCGM — экспорт Minecraft в Garry's Mod",
+  "screen.mcgm.subtitle": "Выбор координат региона и параметров компиляции",
+  "screen.mcgm.min_coords": "Точка 1 (Min X, Y, Z)",
+  "screen.mcgm.max_coords": "Точка 2 (Max X, Y, Z)",
+  "screen.mcgm.take_pos": "Моя позиция",
+  "screen.mcgm.radius_32": "Радиус 32 вокруг меня",
+  "screen.mcgm.map_name": "Имя карты:",
+  "screen.mcgm.category": "Категория:",
+  "screen.mcgm.lighting": "Освещение Minecraft",
+  "screen.mcgm.import_gmod": "Импорт в Garry's Mod",
+  "screen.mcgm.export_vmf": "Экспорт исходника Hammer VMF",
+  "screen.mcgm.export_button": "Экспорт в Garry's Mod",
+  "screen.mcgm.open_gui": "Открыть в окне программы MCGM",
+  "screen.mcgm.mcgm_path": "Путь к mcgm.exe:",
+  "screen.mcgm.close": "Закрыть"
+}

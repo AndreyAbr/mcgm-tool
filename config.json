@@ -1,0 +1,12 @@
+{
+  "studiomdl_path": "F:\\Steam\\steamapps\\common\\GarrysMod\\bin\\studiomdl.exe",
+  "vbsp_path": "C:\\Tools\\Tools++\\tools++_windows\\vbsp++.exe",
+  "vvis_path": "C:\\Tools\\Tools++\\tools++_windows\\vvis++.exe",
+  "vrad_path": "C:\\Tools\\Tools++\\tools++_windows\\vrad++.exe",
+  "game_dir": "F:\\Steam\\steamapps\\common\\GarrysMod\\garrysmod",
+  "vtfcmd_path": "C:\\Tools\\VTFLib\\bin\\x86\\VTFCmd.exe",
+  "vanilla_jar_path": "C:\\Users\\abram\\AppData\\Roaming\\.minecraft\\versions\\Fabric 1.20.1\\Fabric 1.20.1.jar",
+  "world_path": "C:\\Users\\abram\\AppData\\Roaming\\.minecraft\\saves",
+  "scale_factor": 39.37,
+  "max_convex_pieces": 64
+}

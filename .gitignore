@@ -1,0 +1,44 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pytest_cache/
+
+# Build and distribution
+build/
+dist/
+target/
+*.exe
+*.egg-info/
+
+# Export and temporary directories
+temp/
+exports/
+export_out/
+output/
+garrysmod/
+minecraft_mod/build/
+minecraft_mod/.gradle/
+minecraft_mod/tools/
+
+# Logs and runtime dumps
+*.log
+*.tmp
+*.bak
+gui_state.json
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Agents and AI session state
+.agents/
+.gemini/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini

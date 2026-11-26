@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "mcgm-bridge",
+  "version": "1.0.0",
+  "name": "mcgm-bridge",
+  "description": "Ingame Minecraft to Garry's Mod export tool bridge with selection and export controls",
+  "authors": [
+    "abr"
+  ],
+  "contact": {
+    "homepage": "https://revariant.ru"
+  },
+  "license": "MIT",
+  "icon": "assets/mcgm/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.abr.mcgmBridge"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.14.21",
+    "minecraft": "~1.20.1",
+    "java": ">=17",
+    "fabric-api": "*"
+  }
+}
