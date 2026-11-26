@@ -354,12 +354,6 @@ if (Test-Path $dotMinecraftDir) {
     Write-Host "Skipping default .minecraft\mods install ($dotMinecraftDir not found)."
 }
 
-$prismMccMods = "H:\Games\PrismLauncher\instances\mcc\minecraft\mods"
-if (Test-Path $prismMccMods) {
-    Write-Host "Installing to PrismLauncher mcc: $prismMccMods\mcgm-bridge-1.0.0.jar..."
-    Copy-Item -Path $finalJar -Destination (Join-Path $prismMccMods "mcgm-bridge-1.0.0.jar") -Force
-}
-
 Write-Host "=========================================================="
 Write-Host " Build & Installation complete!                           "
 Write-Host "=========================================================="
