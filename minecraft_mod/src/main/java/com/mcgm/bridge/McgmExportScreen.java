@@ -88,17 +88,22 @@ public class McgmExportScreen extends Screen {
     }
 
     private String formatDimensionName(String dim, boolean isRu) {
+        if (dim == null || dim.isEmpty()) {
+            return isRu ? "Верхний" : "Overworld";
+        }
         if (isRu) {
             return switch (dim) {
+                case "overworld" -> "Верхний";
                 case "nether" -> "Незер";
                 case "end" -> "Энд";
-                default -> "Верхний";
+                default -> dim;
             };
         }
         return switch (dim) {
+            case "overworld" -> "Overworld";
             case "nether" -> "Nether";
             case "end" -> "End";
-            default -> "Overworld";
+            default -> dim;
         };
     }
 

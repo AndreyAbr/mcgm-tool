@@ -23,8 +23,8 @@ use crate::anvil::{load_world_region, WorldCoords};
 use crate::assets::{AssetIndex, ResolvedBlockModel};
 use crate::atlas::{
     build_sign_atlas_with_assets, build_texture_atlas, collect_animated_materials,
-    compute_atlas_cache_hash, export_door_textures, load_atlas_cache_meta, save_atlas_cache_meta,
-    FontRenderer,
+    compute_atlas_cache_hash_with_assets, export_door_textures, load_atlas_cache_meta,
+    save_atlas_cache_meta, FontRenderer,
 };
 use crate::cli::CliArgs;
 use crate::collision::build_world_collision_with_models;
@@ -159,6 +159,7 @@ impl DebugLogFile {
 pub struct PipelineSummary {
     pub bsp_path: PathBuf,
     pub gma_path: Option<PathBuf>,
+    pub gma_error: Option<String>,
     pub chunk_count: usize,
     pub door_count: usize,
     pub total_secs: f64,
@@ -185,24 +186,7 @@ fn is_valid_world_dir(dir: &Path) -> bool {
             || dir.join("region").is_dir()
             || dir.join("DIM-1").join("region").is_dir()
             || dir.join("DIM1").join("region").is_dir()
-            || dir
-                .join("dimensions")
-                .join("minecraft")
-                .join("overworld")
-                .join("region")
-                .is_dir()
-            || dir
-                .join("dimensions")
-                .join("minecraft")
-                .join("the_nether")
-                .join("region")
-                .is_dir()
-            || dir
-                .join("dimensions")
-                .join("minecraft")
-                .join("the_end")
-                .join("region")
-                .is_dir())
+            || dir.join("dimensions").is_dir())
 }
 
 fn auto_select_world(tools: &ToolPaths) -> Option<PathBuf> {
@@ -246,6 +230,49 @@ fn auto_select_world(tools: &ToolPaths) -> Option<PathBuf> {
     None
 }
 
+pub fn resolve_addon_and_work_dirs(output_dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+    let base_output_dir = if output_dir.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(output_dir))
+            .unwrap_or_else(|_| output_dir.to_path_buf())
+    } else {
+        output_dir.to_path_buf()
+    };
+    let matches_name = base_output_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|f| f.eq_ignore_ascii_case(name));
+    let addon_dir = if matches_name {
+        base_output_dir.clone()
+    } else {
+        base_output_dir.join(name)
+    };
+    let work_dir = if matches_name {
+        match base_output_dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            Some(p) if !p.join("_work").join(name).starts_with(&addon_dir) => {
+                p.join("_work").join(name)
+            }
+            _ => std::env::temp_dir().join("mcgm_work").join(name),
+        }
+    } else {
+        base_output_dir.join("_work").join(name)
+    };
+    (addon_dir, work_dir)
+}
+
+pub fn resolve_effective_max_convex(cli_override: usize, config_value: usize) -> usize {
+    if cli_override > 0 {
+        cli_override
+    } else if config_value > 0 {
+        config_value
+    } else {
+        compiler::DEFAULT_MAX_CONVEX_PIECES
+    }
+}
+
 pub fn run_export_pipeline(
     mut opts: PipelineOptions,
     mut on_progress: impl FnMut(u32, &str),
@@ -254,20 +281,8 @@ pub fn run_export_pipeline(
     opts.name = cli::sanitize_safe_name(&opts.name, "mc_export");
     opts.map_name = cli::sanitize_safe_name(&opts.map_name, "gm_mc_export");
     opts.category = cli::sanitize_safe_category(&opts.category);
-    let base_output_dir = if opts.output_dir.is_relative() {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(&opts.output_dir))
-            .unwrap_or_else(|_| opts.output_dir.clone())
-    } else {
-        opts.output_dir.clone()
-    };
-    let addon_dir =
-        if base_output_dir.file_name().and_then(|s| s.to_str()) == Some(opts.name.as_str()) {
-            base_output_dir.clone()
-        } else {
-            base_output_dir.join(&opts.name)
-        };
-    let work_dir = base_output_dir.join("_work").join(&opts.name);
+    let asset_category = compiler::scoped_map_category(&opts.category, &opts.map_name);
+    let (addon_dir, work_dir) = resolve_addon_and_work_dirs(&opts.output_dir, &opts.name);
     std::fs::create_dir_all(&addon_dir).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
 
@@ -359,13 +374,7 @@ pub fn run_export_pipeline(
     } else {
         32
     };
-    let eff_max_convex = if opts.max_convex > 0 {
-        opts.max_convex
-    } else if tools.max_convex_pieces > 64 {
-        tools.max_convex_pieces
-    } else {
-        2048
-    };
+    let eff_max_convex = resolve_effective_max_convex(opts.max_convex, tools.max_convex_pieces);
     let eff_max_workers = if opts.max_workers > 0 {
         opts.max_workers
     } else {
@@ -430,7 +439,13 @@ pub fn run_export_pipeline(
     check_cancel()?;
     emit!(10, "Building texture atlas, sign atlas, animated textures & skybox...");
     let t2 = Instant::now();
-    let atlas_hash8 = compute_atlas_cache_hash(&tex_requests, eff_scale, &opts.lighting_style, 8);
+    let atlas_hash8 = compute_atlas_cache_hash_with_assets(
+        &tex_requests,
+        &assets,
+        eff_scale,
+        &opts.lighting_style,
+        8,
+    );
     let atlas_png = work_dir.join(format!("atlas_{}.png", atlas_hash8));
     let atlas_meta = work_dir.join(format!("atlas_{}.json", atlas_hash8));
     let sign_png = work_dir.join("sign_atlas.png");
@@ -585,7 +600,7 @@ pub fn run_export_pipeline(
                 &cm,
                 c_boxes,
                 &smd_dir,
-                &opts.category,
+                &asset_category,
                 eff_max_convex,
                 &opts.name,
             )?;
@@ -650,46 +665,47 @@ pub fn run_export_pipeline(
     );
 
     struct StagedGameFilesGuard {
-        game_dir: PathBuf,
-        model_rel_paths: Vec<String>,
+        model_guard: Option<compiler::StagedModelGuard>,
         vmt_paths: Vec<PathBuf>,
     }
     impl Drop for StagedGameFilesGuard {
         fn drop(&mut self) {
-            if !self.game_dir.as_os_str().is_empty() && !self.model_rel_paths.is_empty() {
-                compiler::cleanup_staged_model_files(&self.game_dir, &self.model_rel_paths);
-            }
+            let _ = self.model_guard.take();
             if !self.vmt_paths.is_empty() {
                 compiler::cleanup_staged_files(&self.vmt_paths);
             }
         }
     }
-    let mut staged_guard = StagedGameFilesGuard {
-        game_dir: if !opts.import_to_gmod {
-            tools.game_dir.clone()
-        } else {
-            PathBuf::new()
-        },
-        model_rel_paths: if !opts.import_to_gmod {
-            let mut paths = Vec::new();
-            for ch in &chunk_artifacts {
-                if !ch.model_rel_path.is_empty() {
-                    paths.push(ch.model_rel_path.clone());
-                }
-                if let Some(ref tm) = ch.translucent_model_rel_path {
-                    if !tm.is_empty() {
-                        paths.push(tm.clone());
-                    }
-                }
-                for (_, col_mdl) in &ch.extra_collision_models {
-                    if !col_mdl.is_empty() {
-                        paths.push(col_mdl.clone());
-                    }
+    let staged_model_rels: Vec<String> = if !opts.import_to_gmod {
+        let mut paths = Vec::new();
+        for ch in &chunk_artifacts {
+            if !ch.model_rel_path.is_empty() {
+                paths.push(ch.model_rel_path.clone());
+            }
+            if let Some(ref tm) = ch.translucent_model_rel_path {
+                if !tm.is_empty() {
+                    paths.push(tm.clone());
                 }
             }
-            paths
+            for (_, col_mdl) in &ch.extra_collision_models {
+                if !col_mdl.is_empty() {
+                    paths.push(col_mdl.clone());
+                }
+            }
+        }
+        paths
+    } else {
+        Vec::new()
+    };
+    let mut staged_guard = StagedGameFilesGuard {
+        model_guard: if !opts.import_to_gmod && !tools.game_dir.as_os_str().is_empty() {
+            Some(compiler::StagedModelGuard::prepare(
+                &tools.game_dir,
+                &staged_model_rels,
+                &work_dir,
+            )?)
         } else {
-            Vec::new()
+            None
         },
         vmt_paths: Vec::new(),
     };
@@ -727,7 +743,7 @@ pub fn run_export_pipeline(
     let compile_mats_fn = || -> Result<(), String> {
         compiler::compile_materials(
             &tools,
-            &opts.category,
+            &asset_category,
             &atlas_png,
             &sign_png,
             &door_pngs,
@@ -738,7 +754,7 @@ pub fn run_export_pipeline(
         )?;
         compiler::compile_water_materials(
             &tools,
-            &opts.category,
+            &asset_category,
             &water_still_png,
             &water_flow_png,
             &addon_dir,
@@ -746,7 +762,7 @@ pub fn run_export_pipeline(
         )?;
         compiler::compile_animated_materials(
             &tools,
-            &opts.category,
+            &asset_category,
             &anim_entries,
             &addon_dir,
             opts.import_to_gmod,
@@ -830,7 +846,7 @@ pub fn run_export_pipeline(
     let vmf_path = work_dir.join(format!("{}.vmf", opts.map_name));
     let vmf_problems = build_vmf_checked(&VmfBuildParams {
         output_vmf: &vmf_path,
-        category: &opts.category,
+        category: &asset_category,
         bounds_min: bmin,
         bounds_max: bmax,
         chunks: &chunk_artifacts,
@@ -937,14 +953,14 @@ pub fn run_export_pipeline(
             .extend(compiler::stage_collision_vmts_to_game_dir(
                 &addon_dir,
                 &tools.game_dir,
-                &opts.category,
+                &asset_category,
             )?);
         staged_guard
             .vmt_paths
             .extend(compiler::stage_water_vmts_to_game_dir(
                 &addon_dir,
                 &tools.game_dir,
-                &opts.category,
+                &asset_category,
             )?);
     }
 
@@ -1045,21 +1061,35 @@ pub fn run_export_pipeline(
         .parent()
         .unwrap_or(&opts.output_dir)
         .join(format!("{}.gma", opts.map_name));
-    let gma_path = match compiler::create_gma_addon(&tools, &addon_dir, &gma_out, &opts.map_name, |msg| {
-        if let Ok(mut g) = dbg_log.lock() {
-            g.write_line(t_total.elapsed().as_secs_f64(), msg);
-        }
-        println!("{}", msg);
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        on_progress(99, msg);
-    }) {
-        Ok(p) => Some(p),
-        Err(e) => {
+    let (gma_path, gma_error) = match compiler::create_gma_addon(
+        &tools,
+        &addon_dir,
+        &gma_out,
+        &opts.map_name,
+        |msg| {
             if let Ok(mut g) = dbg_log.lock() {
-                g.write_line(t_total.elapsed().as_secs_f64(), &format!("[Pipeline] Warning: failed creating .gma addon: {}", e));
+                g.write_line(t_total.elapsed().as_secs_f64(), msg);
             }
-            eprintln!("[Pipeline] Warning: failed creating .gma addon: {}", e);
-            None
+            println!("{}", msg);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            on_progress(99, msg);
+        },
+    ) {
+        Ok(p) => (Some(p), None),
+        Err(e) => {
+            let warn_msg = format!(
+                "BSP compiled successfully, but failed creating new GMA addon: {}",
+                e
+            );
+            if let Ok(mut g) = dbg_log.lock() {
+                g.write_line(
+                    t_total.elapsed().as_secs_f64(),
+                    &format!("[Pipeline] Warning: {}", warn_msg),
+                );
+            }
+            eprintln!("[Pipeline] Warning: {}", warn_msg);
+            on_progress(99, &format!("[Pipeline] Warning: {}", warn_msg));
+            (None, Some(e))
         }
     };
 
@@ -1071,10 +1101,15 @@ pub fn run_export_pipeline(
     emit!(
         100,
         &format!(
-            "Done! Map: {} ({:.1} MB) in {:.2}s",
+            "Done! Map: {} ({:.1} MB) in {:.2}s{}",
             final_bsp.display(),
             bsp_mb,
-            total_secs
+            total_secs,
+            if gma_error.is_some() {
+                " [GMA FAILED]"
+            } else {
+                ""
+            }
         )
     );
     if let Ok(mut g) = dbg_log.lock() {
@@ -1088,6 +1123,8 @@ pub fn run_export_pipeline(
     println!("Playable Map: maps/{}.bsp -> {}", opts.map_name, final_bsp.display());
     if let Some(ref gp) = gma_path {
         println!("Standalone GMA Addon: {}", gp.display());
+    } else if let Some(ref err) = gma_error {
+        println!("Warning: BSP compiled, but creating new GMA addon failed: {}", err);
     }
     println!("=== Stage Timings ===");
     for (stage, secs) in &timings {
@@ -1098,6 +1135,7 @@ pub fn run_export_pipeline(
     Ok(PipelineSummary {
         bsp_path: final_bsp,
         gma_path,
+        gma_error,
         chunk_count,
         door_count,
         total_secs,
@@ -1107,6 +1145,102 @@ pub fn run_export_pipeline(
 
 fn is_cli_explicit(matches: &clap::ArgMatches, id: &str) -> bool {
     matches.value_source(id) == Some(ValueSource::CommandLine)
+}
+
+pub fn build_gui_launch_config(args: &CliArgs, matches: &clap::ArgMatches) -> GuiLaunchConfig {
+    let (parsed_coords, startup_error, auto_start) = if args.coords.is_empty() {
+        (None, None, args.auto_start)
+    } else {
+        match args.parsed_coords() {
+            Ok(c) => (Some(c), None, args.auto_start),
+            Err(e) => {
+                let msg = format!("Error parsing --coords: {}", e);
+                eprintln!("{}", msg);
+                (None, Some(msg), false)
+            }
+        }
+    };
+    let lang_opt = args.lang.as_deref().map(|l| {
+        if l.trim().eq_ignore_ascii_case("ru") {
+            UiLang::Ru
+        } else {
+            UiLang::En
+        }
+    });
+    let import_opt = if args.no_import_to_gmod {
+        Some(false)
+    } else if is_cli_explicit(matches, "import_to_gmod") {
+        Some(true)
+    } else {
+        None
+    };
+    let mc_phys_opt = if args.no_mc_physics {
+        Some(false)
+    } else if is_cli_explicit(matches, "mc_physics") {
+        Some(true)
+    } else {
+        None
+    };
+    let hq_opt = if is_cli_explicit(matches, "hq_light") || args.preset.as_deref() == Some("hq") {
+        Some(args.effective_hq_light())
+    } else {
+        None
+    };
+    let fast_opt = if is_cli_explicit(matches, "fast_vrad") || args.preset.is_some() {
+        Some(args.effective_fast_vrad())
+    } else {
+        None
+    };
+    let brushes_opt = if args.vmf_brushes || is_cli_explicit(matches, "collision_mode") {
+        Some(args.effective_vmf_brushes())
+    } else {
+        None
+    };
+    let reuse_opt = if is_cli_explicit(matches, "reuse_cache") || args.preset.as_deref() == Some("preview") {
+        Some(args.effective_reuse_cache())
+    } else {
+        None
+    };
+
+    let gui_world = if args.world.as_ref().is_some_and(|p| p.is_dir()) {
+        args.world.clone()
+    } else if let Some(ref inst_query) = args.instance {
+        let cfg = resolve_config_path(args.config.as_deref());
+        let all = instances::discover_all_instances(cfg.as_deref(), &[]);
+        instances::find_instance_by_query(&all, inst_query)
+            .and_then(|inst| instances::resolve_world_in_instance(inst, args.world.as_deref()))
+            .or_else(|| args.world.clone())
+    } else {
+        args.world.clone()
+    };
+
+    GuiLaunchConfig {
+        world: gui_world,
+        coords: parsed_coords,
+        dimension: is_cli_explicit(matches, "dimension").then(|| args.dimension.clone()),
+        name: args.name.clone(),
+        category: is_cli_explicit(matches, "category").then(|| args.category.clone()),
+        map_name: args.map.clone(),
+        output_dir: is_cli_explicit(matches, "output_dir").then(|| args.output_dir.clone()),
+        config_path: args.config.clone(),
+        lighting_style: is_cli_explicit(matches, "lighting_style")
+            .then(|| args.lighting_style.clone()),
+        scale: args.scale,
+        mc_physics: mc_phys_opt,
+        hq_light: hq_opt,
+        fast_vrad: fast_opt,
+        export_vmf: args.export_vmf.then_some(true),
+        import_to_gmod: import_opt,
+        force_vmf_brushes: brushes_opt,
+        chunk_size: is_cli_explicit(matches, "chunk_size").then_some(args.chunk_size),
+        max_workers: args.max_workers,
+        max_convex: args.max_convex,
+        reuse_cache: reuse_opt,
+        debug_log: args.debug_log.clone(),
+        startup_error,
+        auto_start,
+        lang: lang_opt,
+    }
 }
 
 #[cfg(all(windows, not(test)))]
@@ -1285,83 +1419,7 @@ fn main() {
     }
 
     if args.should_launch_gui(raw_argc) {
-        let parsed_coords = if args.coords.is_empty() {
-            None
-        } else {
-            args.parsed_coords().ok()
-        };
-        let lang_opt = args.lang.as_deref().map(|l| {
-            if l.trim().eq_ignore_ascii_case("ru") {
-                UiLang::Ru
-            } else {
-                UiLang::En
-            }
-        });
-        let import_opt = if args.no_import_to_gmod {
-            Some(false)
-        } else if is_cli_explicit(&matches, "import_to_gmod") {
-            Some(true)
-        } else {
-            None
-        };
-        let mc_phys_opt = if args.no_mc_physics {
-            Some(false)
-        } else if is_cli_explicit(&matches, "mc_physics") {
-            Some(true)
-        } else {
-            None
-        };
-        let hq_opt = if is_cli_explicit(&matches, "hq_light")
-            || args.preset.as_deref() == Some("hq")
-        {
-            Some(args.effective_hq_light())
-        } else {
-            None
-        };
-        let fast_opt = if is_cli_explicit(&matches, "fast_vrad") || args.preset.is_some() {
-            Some(args.effective_fast_vrad())
-        } else {
-            None
-        };
-        let brushes_opt = if args.vmf_brushes || is_cli_explicit(&matches, "collision_mode") {
-            Some(args.effective_vmf_brushes())
-        } else {
-            None
-        };
-
-        let gui_world = if args.world.as_ref().is_some_and(|p| p.is_dir()) {
-            args.world.clone()
-        } else if let Some(ref inst_query) = args.instance {
-            let cfg = resolve_config_path(args.config.as_deref());
-            let all = instances::discover_all_instances(cfg.as_deref(), &[]);
-            instances::find_instance_by_query(&all, inst_query)
-                .and_then(|inst| instances::resolve_world_in_instance(inst, args.world.as_deref()))
-                .or_else(|| args.world.clone())
-        } else {
-            args.world.clone()
-        };
-
-        let cfg = GuiLaunchConfig {
-            world: gui_world,
-            coords: parsed_coords,
-            dimension: is_cli_explicit(&matches, "dimension").then(|| args.dimension.clone()),
-            name: args.name.clone(),
-            category: is_cli_explicit(&matches, "category").then(|| args.category.clone()),
-            map_name: args.map.clone(),
-            output_dir: is_cli_explicit(&matches, "output_dir").then(|| args.output_dir.clone()),
-            config_path: args.config.clone(),
-            lighting_style: is_cli_explicit(&matches, "lighting_style")
-                .then(|| args.lighting_style.clone()),
-            scale: args.scale,
-            mc_physics: mc_phys_opt,
-            hq_light: hq_opt,
-            fast_vrad: fast_opt,
-            export_vmf: args.export_vmf.then_some(true),
-            import_to_gmod: import_opt,
-            force_vmf_brushes: brushes_opt,
-            auto_start: args.auto_start,
-            lang: lang_opt,
-        };
+        let cfg = build_gui_launch_config(&args, &matches);
         if let Err(e) = run_gui_with_config(cfg) {
             eprintln!("GUI error: {}", e);
             std::process::exit(1);
@@ -1465,6 +1523,12 @@ fn main() {
     match run_export_pipeline(opts, |_, _| {}) {
         Ok(summary) => {
             println!("Export complete: {}", summary.bsp_path.display());
+            if let Some(ref gma_err) = summary.gma_error {
+                eprintln!(
+                    "Warning: BSP compiled, but creating new GMA addon failed: {}",
+                    gma_err
+                );
+            }
         }
         Err(e) => {
             eprintln!("Status: FAILED - {}", e);

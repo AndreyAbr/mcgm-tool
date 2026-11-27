@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub const DEFAULT_MAX_CONVEX_PIECES: usize = 2048;
 
 #[derive(Debug, Clone)]
 pub struct ToolPaths {
@@ -610,7 +611,7 @@ pub fn load_tool_paths(config_path: Option<&Path>) -> ToolPaths {
     let mut cfg_vanilla_jar: Option<PathBuf> = None;
     let mut cfg_world_path: Option<PathBuf> = None;
     let mut scale_factor: f64 = 39.37;
-    let mut max_convex_pieces: usize = 64;
+    let mut max_convex_pieces: usize = DEFAULT_MAX_CONVEX_PIECES;
 
     if let Some(cp) = config_path {
         if let Ok(text) = std::fs::read_to_string(cp) {
@@ -889,7 +890,7 @@ pub fn run_env_check(
             hammer: None,
             world_path: None,
             scale_factor: 39.37,
-            max_convex_pieces: 64,
+            max_convex_pieces: DEFAULT_MAX_CONVEX_PIECES,
         }
     } else {
         load_tool_paths(config_path)
@@ -1202,6 +1203,9 @@ fn convert_png_to_vtf_with_mode(
                 String::from_utf8_lossy(&out.stderr)
             ));
         }
+        if let Some(src_hash) = compute_file_fnv1a_hex(png_path) {
+            let _ = std::fs::write(out_vtf.with_extension("vtf.src_hash"), src_hash);
+        }
         Ok(out_vtf.clone())
     };
 
@@ -1214,6 +1218,17 @@ fn convert_png_to_vtf_with_mode(
             })
         }
         Err(e) => Err(e),
+    }
+}
+
+pub fn scoped_map_category(category: &str, map_name: &str) -> String {
+    let clean_cat = crate::cli::sanitize_safe_category(category);
+    let clean_map = crate::cli::sanitize_safe_name(map_name, "gm_mc_export").to_ascii_lowercase();
+    let last_seg = clean_cat.rsplit('/').next().unwrap_or("");
+    if last_seg.eq_ignore_ascii_case(&clean_map) {
+        clean_cat
+    } else {
+        format!("{}/{}", clean_cat, clean_map)
     }
 }
 
@@ -1248,7 +1263,26 @@ pub fn compile_materials(
             return false;
         };
         let vtf = out_d.join(format!("{}.vtf", stem));
-        vtf.metadata().map(|m| m.is_file() && m.len() > 0).unwrap_or(false)
+        let Ok(vtf_meta) = vtf.metadata() else {
+            return false;
+        };
+        if !vtf_meta.is_file() || vtf_meta.len() == 0 {
+            return false;
+        }
+        let hash_path = vtf.with_extension("vtf.src_hash");
+        if hash_path.is_file() {
+            return std::fs::read_to_string(&hash_path)
+                .ok()
+                .zip(compute_file_fnv1a_hex(src_png))
+                .is_some_and(|(saved, cur)| saved.trim() == cur);
+        }
+        match (
+            vtf_meta.modified().ok(),
+            src_png.metadata().and_then(|m| m.modified()).ok(),
+        ) {
+            (Some(vtf_mtime), Some(png_mtime)) => vtf_mtime >= png_mtime,
+            _ => false,
+        }
     };
 
     // 1. Convert main atlas, sign atlas, doors, and skybox faces in parallel
@@ -2008,6 +2042,17 @@ where
         .map_err(|e| e.to_string())?;
 
     let is_nonempty = |p: &Path| p.is_file() && p.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    let all_job_rels: Vec<String> = jobs.iter().map(|j| j.mdl_rel.clone()).collect();
+    let _local_guard = if !import_to_gmod {
+        let backup_root = std::env::temp_dir().join("mcgm_staged_backup");
+        Some(StagedModelGuard::prepare(
+            &tools.game_dir,
+            &all_job_rels,
+            &backup_root,
+        )?)
+    } else {
+        None
+    };
     let total_jobs = jobs.len();
     let done_jobs = std::sync::atomic::AtomicUsize::new(0);
     let cached_jobs = std::sync::atomic::AtomicUsize::new(0);
@@ -2025,21 +2070,28 @@ where
                         let expected_mdl = tools.game_dir.join(&job.mdl_rel);
                         let expected_phy = expected_mdl.with_extension("phy");
                         let addon_mdl = addon_dir.join(&job.mdl_rel);
+                        let addon_phy = addon_mdl.with_extension("phy");
 
                         if reuse_existing
                             && is_nonempty(&addon_mdl)
-                            && is_nonempty(&expected_mdl)
+                            && (!qc_has_collision || is_nonempty(&addon_phy))
                             && qc_cache_signature_matches(&job.qc_path, &addon_mdl)
                         {
+                            if import_to_gmod {
+                                sync_cached_model_files(addon_dir, &tools.game_dir, &job.mdl_rel)?;
+                            }
                             was_cached = true;
-                            let has_phy = is_nonempty(&expected_phy);
+                            let has_phy = is_nonempty(&addon_phy);
                             Ok(QcOutcome::Main {
                                 chunk_idx,
                                 used_fallback: qc_has_collision && !has_phy,
                             })
                         } else {
-                            for ext in ["mdl", "vvd", "phy", "dx80.vtx", "dx90.vtx", "sw.vtx"] {
-                                let _ = std::fs::remove_file(expected_mdl.with_extension(ext));
+                            for p in model_sidecar_paths(&tools.game_dir, &job.mdl_rel) {
+                                let _ = std::fs::remove_file(p);
+                            }
+                            if let Some(parent) = expected_mdl.parent() {
+                                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                             }
                             let (ok, first_log) =
                                 run_studiomdl(&tools.studiomdl, &tools.game_dir, &job.qc_path);
@@ -2086,7 +2138,7 @@ where
                                 &tools.game_dir,
                                 addon_dir,
                                 &job.mdl_rel,
-                                import_to_gmod,
+                                true,
                             )?;
                             write_qc_cache_signature(&job.qc_path, &addon_mdl);
                             Ok(QcOutcome::Main {
@@ -2100,14 +2152,19 @@ where
                         let addon_t_mdl = addon_dir.join(&job.mdl_rel);
                         if reuse_existing
                             && is_nonempty(&addon_t_mdl)
-                            && is_nonempty(&expected_t_mdl)
                             && qc_cache_signature_matches(&job.qc_path, &addon_t_mdl)
                         {
+                            if import_to_gmod {
+                                sync_cached_model_files(addon_dir, &tools.game_dir, &job.mdl_rel)?;
+                            }
                             was_cached = true;
                             Ok(QcOutcome::Translucent { chunk_idx, ok: true })
                         } else {
-                            for ext in ["mdl", "vvd", "phy", "dx80.vtx", "dx90.vtx", "sw.vtx"] {
-                                let _ = std::fs::remove_file(expected_t_mdl.with_extension(ext));
+                            for p in model_sidecar_paths(&tools.game_dir, &job.mdl_rel) {
+                                let _ = std::fs::remove_file(p);
+                            }
+                            if let Some(parent) = expected_t_mdl.parent() {
+                                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                             }
                             let (t_status, _t_log) =
                                 run_studiomdl(&tools.studiomdl, &tools.game_dir, &job.qc_path);
@@ -2118,7 +2175,7 @@ where
                                     &tools.game_dir,
                                     addon_dir,
                                     &job.mdl_rel,
-                                    import_to_gmod,
+                                    true,
                                 )
                                 .is_ok();
                             if ok {
@@ -2135,10 +2192,11 @@ where
                         if reuse_existing
                             && is_nonempty(&addon_c_mdl)
                             && is_nonempty(&addon_c_phy)
-                            && is_nonempty(&expected_c_mdl)
-                            && is_nonempty(&expected_c_phy)
                             && qc_cache_signature_matches(&job.qc_path, &addon_c_mdl)
                         {
+                            if import_to_gmod {
+                                sync_cached_model_files(addon_dir, &tools.game_dir, &job.mdl_rel)?;
+                            }
                             was_cached = true;
                             Ok(QcOutcome::ExtraCol {
                                 chunk_idx,
@@ -2146,8 +2204,11 @@ where
                                 ok: true,
                             })
                         } else {
-                            for ext in ["mdl", "vvd", "phy", "dx80.vtx", "dx90.vtx", "sw.vtx"] {
-                                let _ = std::fs::remove_file(expected_c_mdl.with_extension(ext));
+                            for p in model_sidecar_paths(&tools.game_dir, &job.mdl_rel) {
+                                let _ = std::fs::remove_file(p);
+                            }
+                            if let Some(parent) = expected_c_mdl.parent() {
+                                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                             }
                             let (c_status, _c_log) =
                                 run_studiomdl(&tools.studiomdl, &tools.game_dir, &job.qc_path);
@@ -2160,7 +2221,7 @@ where
                                     &tools.game_dir,
                                     addon_dir,
                                     &job.mdl_rel,
-                                    import_to_gmod,
+                                    true,
                                 )
                                 .is_ok();
                             if ok {
@@ -2343,13 +2404,40 @@ pub fn strip_collision_from_qc(qc_path: &Path) -> Result<(), String> {
     std::fs::write(qc_path, out).map_err(|e| e.to_string())
 }
 
+const MODEL_SIDECAR_EXTS: [&str; 7] = [
+    ".mdl",
+    ".vvd",
+    ".dx80.vtx",
+    ".dx90.vtx",
+    ".sw.vtx",
+    ".vtx",
+    ".phy",
+];
+
+fn strip_mdl_ext(model_rel_path: &str) -> &str {
+    let bytes = model_rel_path.as_bytes();
+    if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".mdl") {
+        &model_rel_path[..bytes.len() - 4]
+    } else {
+        model_rel_path
+    }
+}
+
+fn model_sidecar_paths(base_dir: &Path, model_rel_path: &str) -> Vec<PathBuf> {
+    let rel_no_ext = strip_mdl_ext(model_rel_path);
+    MODEL_SIDECAR_EXTS
+        .iter()
+        .map(|ext| base_dir.join(format!("{}{}", rel_no_ext, ext)))
+        .collect()
+}
+
 fn copy_compiled_model_files(
     game_dir: &Path,
     addon_dir: &Path,
     model_rel_path: &str,
     keep_in_game_dir: bool,
 ) -> Result<(), String> {
-    let rel_no_ext = model_rel_path.trim_end_matches(".mdl");
+    let rel_no_ext = strip_mdl_ext(model_rel_path);
     let src_mdl = game_dir.join(format!("{}.mdl", rel_no_ext));
     if !src_mdl.is_file() || src_mdl.metadata().map(|m| m.len() == 0).unwrap_or(true) {
         return Err(format!(
@@ -2358,8 +2446,7 @@ fn copy_compiled_model_files(
         ));
     }
 
-    let exts = [".mdl", ".vvd", ".dx80.vtx", ".dx90.vtx", ".sw.vtx", ".phy"];
-    for ext in exts {
+    for ext in MODEL_SIDECAR_EXTS {
         let rel = format!("{}{}", rel_no_ext, ext);
         let src = game_dir.join(&rel);
         if src.is_file() {
@@ -2391,6 +2478,12 @@ fn fnv1a_update_file(hash: &mut u64, path: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn compute_file_fnv1a_hex(path: &Path) -> Option<String> {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    fnv1a_update_file(&mut hash, path).ok()?;
+    Some(format!("{:016x}", hash))
 }
 
 pub fn compute_qc_cache_hash(qc_path: &Path) -> Option<String> {
@@ -2541,6 +2634,147 @@ pub fn cleanup_staged_files(paths: &[PathBuf]) {
     }
 }
 
+static STAGED_BACKUP_SEQ: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+enum StagedModelEntry {
+    Restore {
+        game_path: PathBuf,
+        backup_path: PathBuf,
+    },
+    RemoveIfCreated(PathBuf),
+}
+
+/// Backs up any pre-existing model sidecars in `game_dir` before staging and
+/// restores them (while removing files created by this run) on `Drop`.
+pub struct StagedModelGuard {
+    entries: Vec<StagedModelEntry>,
+    backup_dir: Option<PathBuf>,
+}
+
+impl StagedModelGuard {
+    pub fn prepare(
+        game_dir: &Path,
+        model_rel_paths: &[String],
+        backup_root: &Path,
+    ) -> Result<Self, String> {
+        if game_dir.as_os_str().is_empty() || model_rel_paths.is_empty() {
+            return Ok(Self {
+                entries: Vec::new(),
+                backup_dir: None,
+            });
+        }
+        let mut seen = HashSet::new();
+        let mut candidate_paths = Vec::new();
+        for rel in model_rel_paths {
+            if rel.is_empty() {
+                continue;
+            }
+            for p in model_sidecar_paths(game_dir, rel) {
+                let key = p.to_string_lossy().to_ascii_lowercase();
+                if seen.insert(key) {
+                    candidate_paths.push(p);
+                }
+            }
+        }
+
+        let mut entries = Vec::with_capacity(candidate_paths.len());
+        let mut backup_dir: Option<PathBuf> = None;
+        for (idx, game_path) in candidate_paths.into_iter().enumerate() {
+            if game_path.is_file() {
+                let bdir = match backup_dir {
+                    Some(ref d) => d.clone(),
+                    None => {
+                        let seq = STAGED_BACKUP_SEQ.fetch_add(1, Ordering::Relaxed);
+                        let d = backup_root.join(format!(
+                            "staged_models_backup_{}_{}",
+                            std::process::id(),
+                            seq
+                        ));
+                        std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+                        backup_dir = Some(d.clone());
+                        d
+                    }
+                };
+                let backup_path = bdir.join(format!("{}.bak", idx));
+                std::fs::copy(&game_path, &backup_path).map_err(|e| {
+                    format!(
+                        "Failed backing up pre-existing game file {}: {}",
+                        game_path.display(),
+                        e
+                    )
+                })?;
+                entries.push(StagedModelEntry::Restore {
+                    game_path,
+                    backup_path,
+                });
+            } else {
+                entries.push(StagedModelEntry::RemoveIfCreated(game_path));
+            }
+        }
+
+        Ok(Self {
+            entries,
+            backup_dir,
+        })
+    }
+}
+
+impl Drop for StagedModelGuard {
+    fn drop(&mut self) {
+        for entry in &self.entries {
+            match entry {
+                StagedModelEntry::Restore {
+                    game_path,
+                    backup_path,
+                } => {
+                    if backup_path.is_file() {
+                        if let Some(p) = game_path.parent() {
+                            let _ = std::fs::create_dir_all(p);
+                        }
+                        if std::fs::copy(backup_path, game_path).is_ok() {
+                            let _ = std::fs::remove_file(backup_path);
+                        }
+                    }
+                }
+                StagedModelEntry::RemoveIfCreated(game_path) => {
+                    if game_path.is_file() {
+                        let _ = std::fs::remove_file(game_path);
+                    }
+                }
+            }
+        }
+        if let Some(ref bdir) = self.backup_dir {
+            let _ = std::fs::remove_dir_all(bdir);
+        }
+    }
+}
+
+fn sync_cached_model_files(
+    addon_dir: &Path,
+    game_dir: &Path,
+    model_rel_path: &str,
+) -> Result<(), String> {
+    if game_dir.as_os_str().is_empty() || model_rel_path.is_empty() {
+        return Ok(());
+    }
+    let rel_no_ext = strip_mdl_ext(model_rel_path);
+    for ext in MODEL_SIDECAR_EXTS {
+        let rel = format!("{}{}", rel_no_ext, ext);
+        let src = addon_dir.join(&rel);
+        let dst = game_dir.join(&rel);
+        if src.is_file() {
+            if let Some(p) = dst.parent() {
+                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
+            std::fs::copy(&src, &dst).map_err(|e| e.to_string())?;
+        } else if dst.is_file() {
+            let _ = std::fs::remove_file(&dst);
+        }
+    }
+    Ok(())
+}
+
 pub fn stage_cached_models_to_game_dir(
     addon_dir: &Path,
     game_dir: &Path,
@@ -2549,7 +2783,6 @@ pub fn stage_cached_models_to_game_dir(
     if game_dir.as_os_str().is_empty() {
         return Ok(());
     }
-    let exts = [".mdl", ".vvd", ".dx80.vtx", ".dx90.vtx", ".sw.vtx", ".phy"];
     let mut rel_paths: Vec<&str> = Vec::new();
     for ch in chunks {
         if !ch.model_rel_path.is_empty() {
@@ -2567,36 +2800,9 @@ pub fn stage_cached_models_to_game_dir(
         }
     }
     for model_rel_path in rel_paths {
-        let rel_no_ext = model_rel_path.trim_end_matches(".mdl");
-        for ext in exts {
-            let rel = format!("{}{}", rel_no_ext, ext);
-            let src = addon_dir.join(&rel);
-            let dst = game_dir.join(&rel);
-            if src.is_file() && !dst.is_file() {
-                if let Some(p) = dst.parent() {
-                    std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-                }
-                std::fs::copy(&src, &dst).map_err(|e| e.to_string())?;
-            }
-        }
+        sync_cached_model_files(addon_dir, game_dir, model_rel_path)?;
     }
     Ok(())
-}
-
-pub fn cleanup_staged_model_files(game_dir: &Path, model_rel_paths: &[String]) {
-    let exts = [".mdl", ".vvd", ".dx80.vtx", ".dx90.vtx", ".sw.vtx", ".phy"];
-    for model_rel_path in model_rel_paths {
-        if model_rel_path.is_empty() {
-            continue;
-        }
-        let rel_no_ext = model_rel_path.trim_end_matches(".mdl");
-        for ext in exts {
-            let p = game_dir.join(format!("{}{}", rel_no_ext, ext));
-            if p.is_file() {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-    }
 }
 
 struct StreamedOutput {
@@ -2926,10 +3132,16 @@ pub fn compile_bsp_map_cancellable<F: FnMut(&str)>(
         t_vbsp.elapsed().as_secs_f64(),
         out_vbsp.code
     ));
+    let fmt_exit_code =
+        |c: Option<i32>| c.map(|n| n.to_string()).unwrap_or_else(|| "unknown".to_string());
+
     if !out_vbsp.success {
         return Err(format!(
-            "VBSP failed (code {:?}):\nSTDOUT:\n{}\nSTDERR:\n{}",
-            out_vbsp.code, out_vbsp.stdout, out_vbsp.stderr
+            "{} failed (exit code {}):\nSTDOUT:\n{}\nSTDERR:\n{}",
+            vbsp_tag,
+            fmt_exit_code(out_vbsp.code),
+            out_vbsp.stdout,
+            out_vbsp.stderr
         ));
     }
 
@@ -3002,14 +3214,12 @@ pub fn compile_bsp_map_cancellable<F: FnMut(&str)>(
             out_vvis.code
         ));
         if !out_vvis.success {
-            log_cb(&format!(
-                "[VVIS] Warning: exited with code {:?}{}",
-                out_vvis.code,
-                if out_vvis.stderr.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", out_vvis.stderr.trim())
-                }
+            return Err(format!(
+                "{} failed (exit code {}):\nSTDOUT:\n{}\nSTDERR:\n{}",
+                vvis_tag,
+                fmt_exit_code(out_vvis.code),
+                out_vvis.stdout,
+                out_vvis.stderr
             ));
         }
     }
@@ -3075,7 +3285,9 @@ pub fn compile_bsp_map_cancellable<F: FnMut(&str)>(
                 t_pass.elapsed().as_secs_f64(),
                 out_vrad.code
             ));
+            let mut used_cpu_fallback = false;
             if !out_vrad.success && is_vrad_pp {
+                used_cpu_fallback = true;
                 log_cb(&format!(
                     "[VRAD++] GPU pass ({}) exited with code {:?}, retrying with -cpu fallback...",
                     rad_mode, out_vrad.code
@@ -3101,15 +3313,18 @@ pub fn compile_bsp_map_cancellable<F: FnMut(&str)>(
                 ));
             }
             if !out_vrad.success {
-                log_cb(&format!(
-                    "[VRAD] Warning ({}): exited with code {:?}{}",
+                let fail_stage = if used_cpu_fallback {
+                    "VRAD++ (CPU fallback)"
+                } else {
+                    tag
+                };
+                return Err(format!(
+                    "{} ({}) failed (exit code {}):\nSTDOUT:\n{}\nSTDERR:\n{}",
+                    fail_stage,
                     rad_mode,
-                    out_vrad.code,
-                    if out_vrad.stderr.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", out_vrad.stderr.trim())
-                    }
+                    fmt_exit_code(out_vrad.code),
+                    out_vrad.stdout,
+                    out_vrad.stderr
                 ));
             }
             Ok(())
@@ -3154,7 +3369,17 @@ pub fn write_addon_metadata(addon_dir: &Path, map_name: &str) -> Result<(), Stri
         "title": title,
         "type": "map",
         "tags": ["fun", "roleplay"],
-        "ignore": ["*.vmf", "*.mcgm_hash", format!("maps/{}.png", clean_map)]
+        "ignore": [
+            "_work/*",
+            "*.vmf",
+            "*.smd",
+            "*.qc",
+            "*.log",
+            "*.prt",
+            "*.lin",
+            "*.mcgm_hash",
+            format!("maps/{}.png", clean_map)
+        ]
     });
     std::fs::write(
         addon_dir.join("addon.json"),
@@ -3180,6 +3405,13 @@ fn collect_gma_files_recursive(
             .metadata()
             .map_err(|e| format!("Failed stat {}: {}", path.display(), e))?;
         if meta.is_dir() {
+            let is_work_dir = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("_work"));
+            if is_work_dir {
+                continue;
+            }
             collect_gma_files_recursive(root, &path, out)?;
         } else if meta.is_file() {
             let rel = path
@@ -3188,11 +3420,19 @@ fn collect_gma_files_recursive(
                 .to_string_lossy()
                 .replace('\\', "/");
             let lower = rel.to_ascii_lowercase();
-            // Skip addon.json itself, VMF sources, cache signatures, and top-level maps/*.png (keep maps/thumb/*.png).
+            // Skip addon.json, working build artifacts, cache signatures, and top-level maps/*.png (keep maps/thumb/*.png).
             if lower == "addon.json"
+                || lower.starts_with("_work/")
                 || lower.ends_with(".vmf")
                 || lower.ends_with(".gma")
                 || lower.ends_with(".mcgm_hash")
+                || lower.ends_with(".smd")
+                || lower.ends_with(".qc")
+                || lower.ends_with(".log")
+                || lower.ends_with(".prt")
+                || lower.ends_with(".lin")
+                || lower.ends_with(".vmx")
+                || lower.ends_with(".tmp")
             {
                 continue;
             }
@@ -3208,15 +3448,58 @@ fn collect_gma_files_recursive(
     Ok(())
 }
 
-pub fn pack_gma_v3_native(
+static TEMP_GMA_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct TempFileGuard(Option<PathBuf>);
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(ref p) = self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+fn make_temp_gma_path(out_gma: &Path, tag: &str) -> PathBuf {
+    let parent = out_gma
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = out_gma
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("addon");
+    let seq = TEMP_GMA_SEQ.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(
+        ".{}.{}.{}.{}.tmp.gma",
+        stem,
+        tag,
+        std::process::id(),
+        seq
+    ))
+}
+
+fn pack_gma_v3_native_impl<F: FnMut(&Path) -> Result<(), String>>(
     addon_dir: &Path,
     out_gma: &Path,
     title: &str,
     description_json: &str,
+    mut after_file_list_hook: F,
 ) -> Result<(), String> {
     use std::io::{Read, Write};
 
-    if let Some(parent) = out_gma.parent() {
+    if let Some(parent) = out_gma.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {}", e))?;
     }
 
@@ -3229,91 +3512,124 @@ pub fn pack_gma_v3_native(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let mut out = std::io::BufWriter::with_capacity(
-        128 * 1024,
-        std::fs::File::create(out_gma)
-            .map_err(|e| format!("Failed creating {}: {}", out_gma.display(), e))?,
-    );
-    let mut header_crc = flate2::Crc::new();
+    let tmp_gma = make_temp_gma_path(out_gma, "native");
+    let mut guard = TempFileGuard::new(tmp_gma.clone());
 
-    let write_tracked = |w: &mut std::io::BufWriter<std::fs::File>,
-                         crc: &mut flate2::Crc,
-                         bytes: &[u8]|
-     -> Result<(), String> {
-        crc.update(bytes);
-        w.write_all(bytes).map_err(|e| e.to_string())
-    };
+    {
+        let mut out = std::io::BufWriter::with_capacity(
+            128 * 1024,
+            std::fs::File::create(&tmp_gma)
+                .map_err(|e| format!("Failed creating {}: {}", tmp_gma.display(), e))?,
+        );
+        let mut header_crc = flate2::Crc::new();
 
-    write_tracked(&mut out, &mut header_crc, b"GMAD")?;
-    write_tracked(&mut out, &mut header_crc, &[3u8])?;
-    write_tracked(&mut out, &mut header_crc, &0u64.to_le_bytes())?; // SteamID
-    write_tracked(&mut out, &mut header_crc, &timestamp.to_le_bytes())?;
-    write_tracked(&mut out, &mut header_crc, &[0u8])?; // Required content (empty)
-    write_tracked(&mut out, &mut header_crc, title.as_bytes())?;
-    write_tracked(&mut out, &mut header_crc, &[0u8])?;
-    write_tracked(&mut out, &mut header_crc, description_json.as_bytes())?;
-    write_tracked(&mut out, &mut header_crc, &[0u8])?;
-    write_tracked(&mut out, &mut header_crc, b"MCGM")?; // Author
-    write_tracked(&mut out, &mut header_crc, &[0u8])?;
-    write_tracked(&mut out, &mut header_crc, &1i32.to_le_bytes())?; // Addon version
+        let write_tracked = |w: &mut std::io::BufWriter<std::fs::File>,
+                             crc: &mut flate2::Crc,
+                             bytes: &[u8]|
+         -> Result<(), String> {
+            crc.update(bytes);
+            w.write_all(bytes).map_err(|e| e.to_string())
+        };
 
-    let mut buf = vec![0u8; 65536];
-    let mut file_sizes: Vec<u64> = Vec::with_capacity(files.len());
-    for (idx, (rel, path)) in files.iter().enumerate() {
-        let file_num = (idx + 1) as u32;
-        let mut f = std::fs::File::open(path)
-            .map_err(|e| format!("Failed reading {}: {}", path.display(), e))?;
-        let mut file_crc = flate2::Crc::new();
-        let mut actual_size: u64 = 0;
-        loop {
-            let n = f
-                .read(&mut buf)
-                .map_err(|e| format!("Failed reading {}: {}", path.display(), e))?;
-            if n == 0 {
-                break;
-            }
-            file_crc.update(&buf[..n]);
-            actual_size += n as u64;
-        }
-        file_sizes.push(actual_size);
-
-        write_tracked(&mut out, &mut header_crc, &file_num.to_le_bytes())?;
-        write_tracked(&mut out, &mut header_crc, rel.as_bytes())?;
+        write_tracked(&mut out, &mut header_crc, b"GMAD")?;
+        write_tracked(&mut out, &mut header_crc, &[3u8])?;
+        write_tracked(&mut out, &mut header_crc, &0u64.to_le_bytes())?; // SteamID
+        write_tracked(&mut out, &mut header_crc, &timestamp.to_le_bytes())?;
+        write_tracked(&mut out, &mut header_crc, &[0u8])?; // Required content (empty)
+        write_tracked(&mut out, &mut header_crc, title.as_bytes())?;
         write_tracked(&mut out, &mut header_crc, &[0u8])?;
-        write_tracked(&mut out, &mut header_crc, &(actual_size as i64).to_le_bytes())?;
-        write_tracked(&mut out, &mut header_crc, &file_crc.sum().to_le_bytes())?;
-    }
-    write_tracked(&mut out, &mut header_crc, &0u32.to_le_bytes())?; // End of file list
+        write_tracked(&mut out, &mut header_crc, description_json.as_bytes())?;
+        write_tracked(&mut out, &mut header_crc, &[0u8])?;
+        write_tracked(&mut out, &mut header_crc, b"MCGM")?; // Author
+        write_tracked(&mut out, &mut header_crc, &[0u8])?;
+        write_tracked(&mut out, &mut header_crc, &1i32.to_le_bytes())?; // Addon version
 
-    for ((_, path), expected_size) in files.iter().zip(file_sizes.iter()) {
-        let mut f = std::fs::File::open(path)
-            .map_err(|e| format!("Failed reading {}: {}", path.display(), e))?;
-        let mut written: u64 = 0;
-        loop {
-            let n = f
-                .read(&mut buf)
+        let mut buf = vec![0u8; 65536];
+        let mut file_sizes: Vec<u64> = Vec::with_capacity(files.len());
+        for (idx, (rel, path)) in files.iter().enumerate() {
+            let file_num = (idx + 1) as u32;
+            let mut f = std::fs::File::open(path)
                 .map_err(|e| format!("Failed reading {}: {}", path.display(), e))?;
-            if n == 0 {
-                break;
+            let mut file_crc = flate2::Crc::new();
+            let mut actual_size: u64 = 0;
+            loop {
+                let n = f
+                    .read(&mut buf)
+                    .map_err(|e| format!("Failed reading {}: {}", path.display(), e))?;
+                if n == 0 {
+                    break;
+                }
+                file_crc.update(&buf[..n]);
+                actual_size += n as u64;
             }
-            write_tracked(&mut out, &mut header_crc, &buf[..n])?;
-            written += n as u64;
+            file_sizes.push(actual_size);
+
+            write_tracked(&mut out, &mut header_crc, &file_num.to_le_bytes())?;
+            write_tracked(&mut out, &mut header_crc, rel.as_bytes())?;
+            write_tracked(&mut out, &mut header_crc, &[0u8])?;
+            write_tracked(&mut out, &mut header_crc, &(actual_size as i64).to_le_bytes())?;
+            write_tracked(&mut out, &mut header_crc, &file_crc.sum().to_le_bytes())?;
         }
-        if written != *expected_size {
-            return Err(format!(
-                "File size changed while packing GMA: {} ({} != {})",
-                path.display(),
-                written,
-                expected_size
-            ));
+        write_tracked(&mut out, &mut header_crc, &0u32.to_le_bytes())?; // End of file list
+        out.flush().map_err(|e| e.to_string())?;
+        after_file_list_hook(&tmp_gma)?;
+
+        for ((_, path), expected_size) in files.iter().zip(file_sizes.iter()) {
+            let mut f = std::fs::File::open(path)
+                .map_err(|e| format!("Failed reading {}: {}", path.display(), e))?;
+            let mut written: u64 = 0;
+            loop {
+                let n = f
+                    .read(&mut buf)
+                    .map_err(|e| format!("Failed reading {}: {}", path.display(), e))?;
+                if n == 0 {
+                    break;
+                }
+                write_tracked(&mut out, &mut header_crc, &buf[..n])?;
+                written += n as u64;
+            }
+            if written != *expected_size {
+                return Err(format!(
+                    "File size changed while packing GMA: {} ({} != {})",
+                    path.display(),
+                    written,
+                    expected_size
+                ));
+            }
         }
+
+        let final_crc = header_crc.sum();
+        out.write_all(&final_crc.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        out.flush().map_err(|e| e.to_string())?;
+        let file = out.into_inner().map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
     }
 
-    let final_crc = header_crc.sum();
-    out.write_all(&final_crc.to_le_bytes())
-        .map_err(|e| e.to_string())?;
-    out.flush().map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp_gma, out_gma)
+        .map_err(|e| format!("Failed replacing {}: {}", out_gma.display(), e))?;
+    guard.disarm();
     Ok(())
+}
+
+pub fn pack_gma_v3_native(
+    addon_dir: &Path,
+    out_gma: &Path,
+    title: &str,
+    description_json: &str,
+) -> Result<(), String> {
+    pack_gma_v3_native_impl(addon_dir, out_gma, title, description_json, |_| Ok(()))
+}
+
+#[cfg(test)]
+pub fn pack_gma_v3_native_with_hook<F: FnMut(&Path) -> Result<(), String>>(
+    addon_dir: &Path,
+    out_gma: &Path,
+    title: &str,
+    description_json: &str,
+    hook: F,
+) -> Result<(), String> {
+    pack_gma_v3_native_impl(addon_dir, out_gma, title, description_json, hook)
 }
 
 pub fn create_gma_addon<F: FnMut(&str)>(
@@ -3323,21 +3639,20 @@ pub fn create_gma_addon<F: FnMut(&str)>(
     map_name: &str,
     mut log_cb: F,
 ) -> Result<PathBuf, String> {
-    if let Some(parent) = out_gma.parent() {
+    if let Some(parent) = out_gma.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {}", e))?;
-    }
-    if out_gma.is_file() {
-        let _ = std::fs::remove_file(out_gma);
     }
 
     if let Some(gmad_exe) = tools.gmad.as_ref().filter(|p| p.is_file()) {
+        let gmad_tmp = make_temp_gma_path(out_gma, "gmad");
+        let mut gmad_guard = TempFileGuard::new(gmad_tmp.clone());
         log_cb(&format!("Packing GMA addon via gmad.exe: {}", out_gma.display()));
         let mut cmd = Command::new(gmad_exe);
         cmd.arg("create")
             .arg("-folder")
             .arg(addon_dir)
             .arg("-out")
-            .arg(out_gma)
+            .arg(&gmad_tmp)
             .arg("-warninvalid");
         #[cfg(windows)]
         {
@@ -3345,7 +3660,14 @@ pub fn create_gma_addon<F: FnMut(&str)>(
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
         match cmd.output() {
-            Ok(output) if output.status.success() && out_gma.is_file() => {
+            Ok(output)
+                if output.status.success()
+                    && gmad_tmp.is_file()
+                    && gmad_tmp.metadata().map(|m| m.len() > 0).unwrap_or(false) =>
+            {
+                std::fs::rename(&gmad_tmp, out_gma)
+                    .map_err(|e| format!("Failed replacing {}: {}", out_gma.display(), e))?;
+                gmad_guard.disarm();
                 return Ok(out_gma.to_path_buf());
             }
             Ok(output) => {

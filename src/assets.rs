@@ -548,6 +548,16 @@ impl AssetIndex {
         None
     }
 
+    pub fn resolve_texture_hash_inputs(
+        &self,
+        tex_ref: &str,
+    ) -> Option<(String, Arc<[u8]>, Option<Arc<[u8]>>)> {
+        let (png_path, bytes) = self.resolve_texture_bytes(tex_ref)?;
+        let mcmeta_path = format!("{}.mcmeta", png_path);
+        let mcmeta = self.get_bytes(&mcmeta_path);
+        Some((png_path, bytes, mcmeta))
+    }
+
     pub fn load_animated_texture_frames(&self, tex_ref: &str) -> Option<AnimatedStrip> {
         let (png_path, bytes) = self.resolve_texture_bytes(tex_ref)?;
         let img = image::load_from_memory(&bytes).ok()?;

@@ -2112,13 +2112,24 @@ pub fn resolve_dimension_region_dir(world_dir: &Path, dimension: &str) -> Result
     }
 
     if let Some((ns, path)) = dim_l.split_once(':') {
-        let cand = world_dir
-            .join("dimensions")
-            .join(ns)
-            .join(path)
-            .join("region");
-        if cand.is_dir() {
-            return Ok(cand);
+        if !ns.is_empty()
+            && !path.is_empty()
+            && !ns.contains(['\\', '/'])
+            && !ns.contains("..")
+            && !path.contains('\\')
+            && !path.contains("..")
+        {
+            let segs: Vec<&str> = path.split('/').collect();
+            if !segs.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+                let mut cand = world_dir.join("dimensions").join(ns);
+                for seg in segs {
+                    cand = cand.join(seg);
+                }
+                cand = cand.join("region");
+                if cand.is_dir() {
+                    return Ok(cand);
+                }
+            }
         }
     } else {
         let cand = world_dir

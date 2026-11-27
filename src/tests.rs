@@ -2567,6 +2567,7 @@ mod suite {
         let summary_with_gma = crate::PipelineSummary {
             bsp_path: std::path::PathBuf::from("output/gm_mc.bsp"),
             gma_path: Some(std::path::PathBuf::from("output/gm_mc.gma")),
+            gma_error: None,
             chunk_count: 12,
             door_count: 3,
             total_secs: 4.5,
@@ -5339,6 +5340,974 @@ mod suite {
         }
         assert!(brush_vmt.contains("\"animatedTextureFrameRate\" \"10.00\""));
         assert!(flow_vmt.contains("\"animatedTextureFrameRate\" \"20.00\""));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_no_import_to_gmod_preserves_preexisting_models_on_success_error_and_cancel() {
+        use crate::compiler::{
+            compile_chunk_models_cached, stage_cached_models_to_game_dir, StagedModelGuard,
+            ToolPaths,
+        };
+
+        let tmp = make_temp_test_dir("no_import_models");
+        let addon_dir = tmp.join("addon");
+        let game_dir = tmp.join("game");
+        let work_dir = tmp.join("work");
+        let smd_dir = work_dir.join("smd");
+        std::fs::create_dir_all(&addon_dir).unwrap();
+        std::fs::create_dir_all(&game_dir).unwrap();
+        std::fs::create_dir_all(&smd_dir).unwrap();
+
+        let mock_studiomdl = tmp.join("mock_studiomdl.cmd");
+        std::fs::write(
+            &mock_studiomdl,
+            "@echo off\r\n\
+            setlocal enabledelayedexpansion\r\n\
+            set \"GAME=\"\r\n\
+            set \"NEXT_GAME=\"\r\n\
+            set \"QC=\"\r\n\
+            for %%A in (%*) do (\r\n\
+                if defined NEXT_GAME (\r\n\
+                    set \"GAME=%%~A\"\r\n\
+                    set \"NEXT_GAME=\"\r\n\
+                ) else if \"%%~A\"==\"-game\" (\r\n\
+                    set \"NEXT_GAME=1\"\r\n\
+                ) else (\r\n\
+                    set \"QC=%%~nA\"\r\n\
+                )\r\n\
+            )\r\n\
+            if \"!QC!\"==\"fail_chunk\" exit /b 1\r\n\
+            mkdir \"!GAME!\\models\\custom_mc\\gm_map\" 2>nul\r\n\
+            echo NEW_MDL_!QC!>\"!GAME!\\models\\custom_mc\\gm_map\\!QC!.mdl\"\r\n\
+            echo NEW_VVD_!QC!>\"!GAME!\\models\\custom_mc\\gm_map\\!QC!.vvd\"\r\n\
+            echo NEW_DX90_!QC!>\"!GAME!\\models\\custom_mc\\gm_map\\!QC!.dx90.vtx\"\r\n\
+            echo NEW_VTX_!QC!>\"!GAME!\\models\\custom_mc\\gm_map\\!QC!.vtx\"\r\n\
+            echo NEW_PHY_!QC!>\"!GAME!\\models\\custom_mc\\gm_map\\!QC!.phy\"\r\n\
+            exit /b 0\r\n",
+        )
+        .unwrap();
+
+        let tools = ToolPaths {
+            studiomdl: mock_studiomdl,
+            vtfcmd: std::path::PathBuf::new(),
+            vbsp: std::path::PathBuf::new(),
+            vvis: std::path::PathBuf::new(),
+            vrad: std::path::PathBuf::new(),
+            gmad: None,
+            game_dir: game_dir.clone(),
+            vanilla_jar: None,
+            hammer: None,
+            world_path: None,
+            scale_factor: 39.37,
+            max_convex_pieces: 2048,
+        };
+
+        let existing_rel = "models/custom_mc/gm_map/chunk_0_0.mdl";
+        let temp_rel = "models/custom_mc/gm_map/chunk_1_0.mdl";
+        let game_model_dir = game_dir.join("models/custom_mc/gm_map");
+        std::fs::create_dir_all(&game_model_dir).unwrap();
+
+        let originals: [(&str, &[u8]); 5] = [
+            ("chunk_0_0.mdl", b"ORIG_MDL_BYTES\x00\x01"),
+            ("chunk_0_0.vvd", b"ORIG_VVD_BYTES\x02\x03"),
+            ("chunk_0_0.vtx", b"ORIG_VTX_BYTES\x04\x05"),
+            ("chunk_0_0.dx90.vtx", b"ORIG_DX90_VTX_BYTES\x06\x07"),
+            ("chunk_0_0.phy", b"ORIG_PHY_BYTES\x08\x09"),
+        ];
+        for (fname, data) in &originals {
+            std::fs::write(game_model_dir.join(fname), data).unwrap();
+        }
+
+        let qc0 = smd_dir.join("chunk_0_0.qc");
+        let qc1 = smd_dir.join("chunk_1_0.qc");
+        let smd0 = smd_dir.join("chunk_0_0.smd");
+        let smd1 = smd_dir.join("chunk_1_0.smd");
+        std::fs::write(&smd0, "version 1\nend\n").unwrap();
+        std::fs::write(&smd1, "version 1\nend\n").unwrap();
+        std::fs::write(&qc0, "$modelname \"custom_mc/gm_map/chunk_0_0.mdl\"\n$body \"b\" \"chunk_0_0.smd\"\n").unwrap();
+        std::fs::write(&qc1, "$modelname \"custom_mc/gm_map/chunk_1_0.mdl\"\n$body \"b\" \"chunk_1_0.smd\"\n").unwrap();
+
+        let mut chunks = vec![
+            CompiledChunkArtifact {
+                chunk_name: "chunk_0_0".to_string(),
+                origin_source: [0.0; 3],
+                qc_path: qc0.clone(),
+                model_rel_path: existing_rel.to_string(),
+                translucent_qc_path: None,
+                translucent_model_rel_path: None,
+                extra_collision_models: Vec::new(),
+                extra_collision_boxes: Vec::new(),
+                overflow_boxes: Vec::new(),
+                fallback_vmf_brushes: false,
+            },
+            CompiledChunkArtifact {
+                chunk_name: "chunk_1_0".to_string(),
+                origin_source: [0.0; 3],
+                qc_path: qc1.clone(),
+                model_rel_path: temp_rel.to_string(),
+                translucent_qc_path: None,
+                translucent_model_rel_path: None,
+                extra_collision_models: Vec::new(),
+                extra_collision_boxes: Vec::new(),
+                overflow_boxes: Vec::new(),
+                fallback_vmf_brushes: false,
+            },
+        ];
+
+        // 1. Direct uncached compile with import_to_gmod = false: pre-existing files must stay byte-identical,
+        // newly compiled chunk_1_0 files must be copied to addon_dir and removed from game_dir.
+        compile_chunk_models_cached(&tools, &mut chunks, &addon_dir, false, 1, false, |_, _, _, _| {})
+            .unwrap();
+
+        for (fname, data) in &originals {
+            assert_eq!(
+                std::fs::read(game_model_dir.join(fname)).unwrap(),
+                *data,
+                "pre-existing {} must stay byte-for-byte intact",
+                fname
+            );
+            assert!(
+                addon_dir.join("models/custom_mc/gm_map").join(fname).is_file(),
+                "addon_dir must receive compiled {}",
+                fname
+            );
+        }
+        for ext in [".mdl", ".vvd", ".vtx", ".dx90.vtx", ".phy"] {
+            assert!(
+                !game_model_dir.join(format!("chunk_1_0{}", ext)).exists(),
+                "newly created chunk_1_0{} must be removed from game_dir",
+                ext
+            );
+            assert!(
+                addon_dir.join(format!("models/custom_mc/gm_map/chunk_1_0{}", ext)).is_file(),
+                "addon_dir must receive chunk_1_0{}",
+                ext
+            );
+        }
+
+        // 2. Pipeline-style StagedModelGuard around cached staging + simulated failure/cancellation
+        let rel_list = vec![existing_rel.to_string(), temp_rel.to_string()];
+        {
+            let _guard = StagedModelGuard::prepare(&game_dir, &rel_list, &work_dir).unwrap();
+            stage_cached_models_to_game_dir(&addon_dir, &game_dir, &chunks).unwrap();
+            assert!(
+                game_model_dir.join("chunk_1_0.mdl").is_file(),
+                "cached model should be temporarily staged in game_dir during VBSP"
+            );
+            // Guard drops here (simulating success, error, or cancellation)
+        }
+        for (fname, data) in &originals {
+            assert_eq!(
+                std::fs::read(game_model_dir.join(fname)).unwrap(),
+                *data,
+                "after guard drop, pre-existing {} must match original bytes",
+                fname
+            );
+        }
+        for ext in [".mdl", ".vvd", ".vtx", ".dx90.vtx", ".phy"] {
+            assert!(
+                !game_model_dir.join(format!("chunk_1_0{}", ext)).exists(),
+                "after guard drop, temporary chunk_1_0{} must be deleted from game_dir",
+                ext
+            );
+        }
+
+        // 3. Cached compile_chunk_models_cached with reuse_existing = true and import_to_gmod = false
+        compile_chunk_models_cached(&tools, &mut chunks, &addon_dir, false, 1, true, |_, _, _, _| {})
+            .unwrap();
+        for (fname, data) in &originals {
+            assert_eq!(std::fs::read(game_model_dir.join(fname)).unwrap(), *data);
+        }
+        assert!(!game_model_dir.join("chunk_1_0.mdl").exists());
+
+        // 4. StudioMDL error on a subsequent chunk must still restore pre-existing game files
+        let fail_qc = smd_dir.join("fail_chunk.qc");
+        std::fs::write(&fail_qc, "$modelname \"custom_mc/gm_map/fail_chunk.mdl\"\n").unwrap();
+        let mut fail_chunks = vec![
+            chunks[0].clone(),
+            CompiledChunkArtifact {
+                chunk_name: "fail_chunk".to_string(),
+                origin_source: [0.0; 3],
+                qc_path: fail_qc,
+                model_rel_path: "models/custom_mc/gm_map/fail_chunk.mdl".to_string(),
+                translucent_qc_path: None,
+                translucent_model_rel_path: None,
+                extra_collision_models: Vec::new(),
+                extra_collision_boxes: Vec::new(),
+                overflow_boxes: Vec::new(),
+                fallback_vmf_brushes: false,
+            },
+        ];
+        let err_res = compile_chunk_models_cached(
+            &tools,
+            &mut fail_chunks,
+            &addon_dir,
+            false,
+            1,
+            false,
+            |_, _, _, _| {},
+        );
+        assert!(err_res.is_err(), "fail_chunk must fail StudioMDL");
+        for (fname, data) in &originals {
+            assert_eq!(std::fs::read(game_model_dir.join(fname)).unwrap(), *data);
+        }
+        assert!(!game_model_dir.join("fail_chunk.mdl").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_gma_preserves_previous_archive_on_write_failure_and_reports_summary() {
+        use crate::compiler::{create_gma_addon, pack_gma_v3_native_with_hook, ToolPaths};
+
+        let tmp = make_temp_test_dir("gma_atomic_preserve");
+        let addon_dir = tmp.join("addon");
+        std::fs::create_dir_all(addon_dir.join("maps")).unwrap();
+        std::fs::write(addon_dir.join("maps/gm_demo.bsp"), b"VBSP_DATA").unwrap();
+
+        let out_gma = tmp.join("gm_demo.gma");
+        let prev_bytes = b"GMAD_PREVIOUS_ARCHIVE_KEEP_ME_INTACT";
+        std::fs::write(&out_gma, prev_bytes).unwrap();
+
+        // 1. Native packer simulated failure AFTER writing header & file list
+        let mut saw_temp_file = false;
+        let err = pack_gma_v3_native_with_hook(
+            &addon_dir,
+            &out_gma,
+            "MCGM - gm_demo",
+            "{}",
+            |tmp_path| {
+                saw_temp_file = tmp_path != out_gma
+                    && tmp_path.is_file()
+                    && tmp_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+                Err("simulated I/O failure mid-write".to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("simulated I/O failure"));
+        assert!(saw_temp_file, "packer must write to a separate temp file first");
+        assert_eq!(
+            std::fs::read(&out_gma).unwrap(),
+            prev_bytes,
+            "previous .gma must remain byte-for-byte intact on write failure"
+        );
+        let leftover_tmps: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp.gma"))
+            .collect();
+        assert!(leftover_tmps.is_empty(), "temp .gma file must be cleaned up on error");
+
+        // 2. Failing gmad.exe writing partial output + failing native fallback (missing addon_dir)
+        let bad_gmad = tmp.join("bad_gmad.cmd");
+        std::fs::write(
+            &bad_gmad,
+            "@echo off\r\necho PARTIAL_GARBAGE>\"%~5\"\r\nexit /b 9\r\n",
+        )
+        .unwrap();
+        let tools_bad = ToolPaths {
+            studiomdl: std::path::PathBuf::new(),
+            vtfcmd: std::path::PathBuf::new(),
+            vbsp: std::path::PathBuf::new(),
+            vvis: std::path::PathBuf::new(),
+            vrad: std::path::PathBuf::new(),
+            gmad: Some(bad_gmad),
+            game_dir: std::path::PathBuf::new(),
+            vanilla_jar: None,
+            hammer: None,
+            world_path: None,
+            scale_factor: 39.37,
+            max_convex_pieces: 2048,
+        };
+        let missing_addon = tmp.join("nonexistent_addon");
+        let mut logs = Vec::new();
+        let res = create_gma_addon(&tools_bad, &missing_addon, &out_gma, "gm_demo", |m| {
+            logs.push(m.to_string());
+        });
+        assert!(res.is_err());
+        assert!(
+            logs.iter().any(|l| l.contains("falling back to native GMA v3 packer")),
+            "must log gmad -> native fallback"
+        );
+        assert_eq!(
+            std::fs::read(&out_gma).unwrap(),
+            prev_bytes,
+            "previous .gma must remain intact when both gmad and native fail"
+        );
+
+        // 3. Failing gmad.exe falls back to native packer on valid addon_dir and atomically replaces out_gma
+        let ok_res = create_gma_addon(&tools_bad, &addon_dir, &out_gma, "gm_demo", |_| {});
+        assert!(ok_res.is_ok());
+        let new_bytes = std::fs::read(&out_gma).unwrap();
+        assert_eq!(&new_bytes[0..4], b"GMAD");
+        assert_ne!(new_bytes, prev_bytes);
+
+        // 4. GUI summary explicitly reports when BSP succeeded but GMA failed
+        let summary_gma_err = crate::PipelineSummary {
+            bsp_path: std::path::PathBuf::from("output/gm_demo.bsp"),
+            gma_path: None,
+            gma_error: Some("disk full".to_string()),
+            chunk_count: 4,
+            door_count: 1,
+            total_secs: 1.5,
+            stage_timings: vec![],
+        };
+        let ru = format_done_summary(UiLang::Ru, &summary_gma_err);
+        let en = format_done_summary(UiLang::En, &summary_gma_err);
+        assert!(ru.contains("BSP") && ru.contains("GMA") && ru.contains("disk full"));
+        assert!(en.contains("BSP") && en.contains("GMA") && en.contains("disk full"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_two_maps_same_category_do_not_overwrite_materials_or_signs() {
+        use crate::compiler::{compile_materials, scoped_map_category, ToolPaths};
+
+        let tmp = make_temp_test_dir("two_maps_category_isolation");
+        let game_dir = tmp.join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+
+        let mock_vtfcmd = tmp.join("mock_vtfcmd.cmd");
+        std::fs::write(
+            &mock_vtfcmd,
+            "@echo off\r\ncopy /y \"%~2\" \"%~4\\%~n2.vtf\" >nul\r\n",
+        )
+        .unwrap();
+
+        let tools = ToolPaths {
+            studiomdl: std::path::PathBuf::new(),
+            vtfcmd: mock_vtfcmd,
+            vbsp: std::path::PathBuf::new(),
+            vvis: std::path::PathBuf::new(),
+            vrad: std::path::PathBuf::new(),
+            gmad: None,
+            game_dir: game_dir.clone(),
+            vanilla_jar: None,
+            hammer: None,
+            world_path: None,
+            scale_factor: 39.37,
+            max_convex_pieces: 2048,
+        };
+
+        let cat_a = scoped_map_category("custom_mc", "gm_map_alpha");
+        let cat_b = scoped_map_category("custom_mc", "gm_map_beta");
+        assert_ne!(cat_a, cat_b);
+
+        let work_a = tmp.join("work_a");
+        let work_b = tmp.join("work_b");
+        let addon_a = tmp.join("addon_a");
+        let addon_b = tmp.join("addon_b");
+        std::fs::create_dir_all(&work_a).unwrap();
+        std::fs::create_dir_all(&work_b).unwrap();
+
+        let atlas_a = work_a.join("atlas_aaaa1111.png");
+        let sign_a = work_a.join("sign_atlas.png");
+        crate::atlas::save_png_fast(&ImageBuffer::from_pixel(16, 16, Rgba([220, 20, 20, 255])), &atlas_a).unwrap();
+        crate::atlas::save_png_fast(&ImageBuffer::from_pixel(16, 16, Rgba([250, 240, 10, 255])), &sign_a).unwrap();
+
+        let atlas_b = work_b.join("atlas_bbbb2222.png");
+        let sign_b = work_b.join("sign_atlas.png");
+        crate::atlas::save_png_fast(&ImageBuffer::from_pixel(16, 16, Rgba([20, 40, 220, 255])), &atlas_b).unwrap();
+        crate::atlas::save_png_fast(&ImageBuffer::from_pixel(16, 16, Rgba([10, 220, 240, 255])), &sign_b).unwrap();
+
+        compile_materials(&tools, &cat_a, &atlas_a, &sign_a, &HashMap::new(), &[], &addon_a, true, false).unwrap();
+        compile_materials(&tools, &cat_b, &atlas_b, &sign_b, &HashMap::new(), &[], &addon_b, true, false).unwrap();
+
+        // Both maps' VMTs and sign atlases coexist in game_dir without overwriting each other
+        let sign_vtf_a = game_dir.join("materials/models").join(&cat_a).join("sign_atlas.vtf");
+        let sign_vtf_b = game_dir.join("materials/models").join(&cat_b).join("sign_atlas.vtf");
+        assert_eq!(std::fs::read(&sign_vtf_a).unwrap(), std::fs::read(&sign_a).unwrap());
+        assert_eq!(std::fs::read(&sign_vtf_b).unwrap(), std::fs::read(&sign_b).unwrap());
+
+        let vmt_a = std::fs::read_to_string(
+            game_dir.join("materials/models").join(&cat_a).join("terrain_opaque.vmt"),
+        )
+        .unwrap();
+        let vmt_b = std::fs::read_to_string(
+            game_dir.join("materials/models").join(&cat_b).join("terrain_opaque.vmt"),
+        )
+        .unwrap();
+        assert!(vmt_a.contains("models/custom_mc/gm_map_alpha/atlas_aaaa1111"));
+        assert!(vmt_b.contains("models/custom_mc/gm_map_beta/atlas_bbbb2222"));
+
+        // Models and VMF reference their own scoped category paths
+        let cm = crate::mesher::ChunkMesh {
+            cx: 0,
+            cz: 0,
+            name: "chunk_0_0".to_string(),
+            origin_source: [0.0; 3],
+            bounds_min: [0.0; 3],
+            bounds_max: [39.37; 3],
+            solid_tris: vec![MeshTri {
+                material: "terrain_opaque".into(),
+                pos: [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+                norm: [[0.0, 0.0, 1.0]; 3],
+                uv: [[0.0, 0.0]; 3],
+            }],
+            translucent_tris: Vec::new(),
+            has_cutout: false,
+        };
+        let art_a = emit_chunk_smds_and_qcs(&cm, &[], &work_a.join("smd"), &cat_a, 64, "gm_map_alpha").unwrap();
+        let art_b = emit_chunk_smds_and_qcs(&cm, &[], &work_b.join("smd"), &cat_b, 64, "gm_map_beta").unwrap();
+        let qc_a = std::fs::read_to_string(&art_a.qc_path).unwrap();
+        let qc_b = std::fs::read_to_string(&art_b.qc_path).unwrap();
+        assert!(qc_a.contains("$cdmaterials \"models/custom_mc/gm_map_alpha\""));
+        assert!(qc_b.contains("$cdmaterials \"models/custom_mc/gm_map_beta\""));
+
+        let vmf_a = work_a.join("gm_map_alpha.vmf");
+        build_vmf(&VmfBuildParams {
+            output_vmf: &vmf_a,
+            category: &cat_a,
+            bounds_min: [-100.0, -100.0, 0.0],
+            bounds_max: [100.0, 100.0, 200.0],
+            chunks: &[art_a],
+            all_solid_boxes: &[],
+            ladder_boxes: &[],
+            water_pools: &[[0.0, 0.0, 0.0, 39.37, 39.37, 35.0]],
+            hazard_boxes: &[],
+            core_occluders: &[],
+            doors: &[],
+            buttons: &[],
+            lights: &[],
+            spawn_points_source: &[[0.0, 0.0, 48.0]],
+            lighting_style: "minecraft",
+            hq_light: false,
+            scale_factor: 39.37,
+            force_vmf_brushes: false,
+        })
+        .unwrap();
+        let vmf_a_txt = std::fs::read_to_string(&vmf_a).unwrap();
+        assert!(vmf_a_txt.contains("models/custom_mc/gm_map_alpha/gm_map_alpha_chunk_0_0.mdl"));
+        assert!(vmf_a_txt.contains("custom_mc/gm_map_alpha/mc_water"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_work_dir_outside_addon_and_gma_excludes_work_files() {
+        use crate::compiler::{create_gma_addon, ToolPaths};
+
+        // 1. --name castle --output-dir C:\exports\castle must place _work outside addon_dir
+        let (addon_same, work_same) =
+            crate::resolve_addon_and_work_dirs(std::path::Path::new(r"C:\exports\castle"), "castle");
+        assert_eq!(addon_same, std::path::PathBuf::from(r"C:\exports\castle"));
+        assert_eq!(work_same, std::path::PathBuf::from(r"C:\exports\_work\castle"));
+        assert!(!work_same.starts_with(&addon_same));
+
+        let (addon_sub, work_sub) =
+            crate::resolve_addon_and_work_dirs(std::path::Path::new(r"C:\exports"), "castle");
+        assert_eq!(addon_sub, std::path::PathBuf::from(r"C:\exports\castle"));
+        assert_eq!(work_sub, std::path::PathBuf::from(r"C:\exports\_work\castle"));
+        assert!(!work_sub.starts_with(&addon_sub));
+
+        // 2. Both native GMA packer and gmad.exe metadata exclude working files
+        let tmp = make_temp_test_dir("gma_exclude_work");
+        let addon_dir = tmp.join("castle");
+        std::fs::create_dir_all(addon_dir.join("maps/thumb")).unwrap();
+        std::fs::create_dir_all(addon_dir.join("materials/models/custom_mc/gm_castle")).unwrap();
+        std::fs::create_dir_all(addon_dir.join("models/custom_mc/gm_castle")).unwrap();
+        std::fs::create_dir_all(addon_dir.join("lua/autorun")).unwrap();
+        std::fs::create_dir_all(addon_dir.join("_work/castle/smd")).unwrap();
+
+        // Real game resources
+        std::fs::write(addon_dir.join("maps/gm_castle.bsp"), b"VBSP").unwrap();
+        std::fs::write(addon_dir.join("maps/thumb/gm_castle.png"), b"PNG").unwrap();
+        std::fs::write(
+            addon_dir.join("materials/models/custom_mc/gm_castle/terrain_opaque.vmt"),
+            b"VMT",
+        )
+        .unwrap();
+        std::fs::write(
+            addon_dir.join("models/custom_mc/gm_castle/chunk_0_0.mdl"),
+            b"IDST",
+        )
+        .unwrap();
+        std::fs::write(addon_dir.join("lua/autorun/mcgm_physics.lua"), b"-- lua").unwrap();
+
+        // Stray work / intermediate files that must NOT enter GMA
+        std::fs::write(addon_dir.join("_work/castle/smd/chunk_0_0.smd"), b"SMD").unwrap();
+        std::fs::write(addon_dir.join("_work/castle/smd/chunk_0_0.qc"), b"QC").unwrap();
+        std::fs::write(addon_dir.join("_work/castle/gm_castle.bsp"), b"INTERMEDIATE_BSP").unwrap();
+        std::fs::write(addon_dir.join("_work/castle/mcgm_debug.log"), b"LOG").unwrap();
+        std::fs::write(addon_dir.join("maps/gm_castle.vmf"), b"VMF").unwrap();
+        std::fs::write(addon_dir.join("maps/compile.log"), b"LOG2").unwrap();
+        std::fs::write(addon_dir.join("models/stray.smd"), b"SMD2").unwrap();
+        std::fs::write(addon_dir.join("models/stray.qc"), b"QC2").unwrap();
+
+        write_addon_metadata(&addon_dir, "gm_castle").unwrap();
+        let meta_txt = std::fs::read_to_string(addon_dir.join("addon.json")).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta_txt).unwrap();
+        let ignores: Vec<&str> = meta["ignore"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for pat in ["_work/*", "*.vmf", "*.smd", "*.qc", "*.log"] {
+            assert!(ignores.contains(&pat), "addon.json ignore missing {}", pat);
+        }
+
+        // Native packer
+        let native_gma = tmp.join("castle_native.gma");
+        pack_gma_v3_native(&addon_dir, &native_gma, "MCGM - gm_castle", "{}").unwrap();
+        let bytes = std::fs::read(&native_gma).unwrap();
+        let text_view = String::from_utf8_lossy(&bytes);
+        assert!(text_view.contains("maps/gm_castle.bsp"));
+        assert!(text_view.contains("models/custom_mc/gm_castle/chunk_0_0.mdl"));
+        assert!(text_view.contains("materials/models/custom_mc/gm_castle/terrain_opaque.vmt"));
+        assert!(text_view.contains("lua/autorun/mcgm_physics.lua"));
+        assert!(!text_view.contains("_work/"));
+        assert!(!text_view.contains("INTERMEDIATE_BSP"));
+        assert!(!text_view.contains(".smd"));
+        assert!(!text_view.contains(".qc"));
+        assert!(!text_view.contains(".log"));
+        assert!(!text_view.contains(".vmf"));
+
+        // gmad.exe path (simulated via mock gmad.cmd verifying addon.json ignore rules exist)
+        let mock_gmad = tmp.join("mock_gmad.cmd");
+        std::fs::write(
+            &mock_gmad,
+            "@echo off\r\n\
+            if not exist \"%~3\\addon.json\" exit /b 2\r\n\
+            findstr /C:\"_work/*\" \"%~3\\addon.json\" >nul || exit /b 3\r\n\
+            echo GMAD_OK>\"%~5\"\r\n",
+        )
+        .unwrap();
+        let tools_gmad = ToolPaths {
+            studiomdl: std::path::PathBuf::new(),
+            vtfcmd: std::path::PathBuf::new(),
+            vbsp: std::path::PathBuf::new(),
+            vvis: std::path::PathBuf::new(),
+            vrad: std::path::PathBuf::new(),
+            gmad: Some(mock_gmad),
+            game_dir: std::path::PathBuf::new(),
+            vanilla_jar: None,
+            hammer: None,
+            world_path: None,
+            scale_factor: 39.37,
+            max_convex_pieces: 2048,
+        };
+        let gmad_out = tmp.join("castle_gmad.gma");
+        create_gma_addon(&tools_gmad, &addon_dir, &gmad_out, "gm_castle", |_| {}).unwrap();
+        assert_eq!(std::fs::read_to_string(&gmad_out).unwrap().trim(), "GMAD_OK");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_vvis_and_vrad_failures_propagate_and_preserve_published_bsp() {
+        use crate::compiler::{compile_bsp_map_cancellable, ToolPaths};
+
+        let tmp = make_temp_test_dir("vvis_vrad_errors");
+        let work_dir = tmp.join("work");
+        let addon_dir = tmp.join("addon");
+        let game_dir = tmp.join("game");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::create_dir_all(addon_dir.join("maps")).unwrap();
+        std::fs::create_dir_all(game_dir.join("maps")).unwrap();
+
+        let vmf_path = work_dir.join("gm_test.vmf");
+        std::fs::write(&vmf_path, "worldspawn {}").unwrap();
+
+        let published_addon_bsp = addon_dir.join("maps/gm_test.bsp");
+        let published_game_bsp = game_dir.join("maps/gm_test.bsp");
+        let old_bsp = b"PUBLISHED_OLD_BSP_DATA";
+        std::fs::write(&published_addon_bsp, old_bsp).unwrap();
+        std::fs::write(&published_game_bsp, old_bsp).unwrap();
+
+        let vbsp_cmd = tmp.join("vbsp++.cmd");
+        std::fs::write(
+            &vbsp_cmd,
+            "@echo off\r\necho NEW_TEMP_BSP>gm_test.bsp\r\necho PRT>gm_test.prt\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+
+        let vvis_fail = tmp.join("vvis_fail.cmd");
+        std::fs::write(&vvis_fail, "@echo off\r\necho vvis error 1>&2\r\nexit /b 7\r\n").unwrap();
+
+        let vvis_ok = tmp.join("vvis++.cmd");
+        std::fs::write(&vvis_ok, "@echo off\r\nexit /b 0\r\n").unwrap();
+
+        let vrad_cpu_retry_ok = tmp.join("vrad++_retry.cmd");
+        std::fs::write(
+            &vrad_cpu_retry_ok,
+            "@echo off\r\n\
+            echo %* | findstr /C:\"-cpu\" >nul\r\n\
+            if errorlevel 1 ( echo gpu crash 1>&2 & exit /b 3 )\r\n\
+            exit /b 0\r\n",
+        )
+        .unwrap();
+
+        let vrad_always_fail = tmp.join("vrad++_fail.cmd");
+        std::fs::write(
+            &vrad_always_fail,
+            "@echo off\r\necho vrad fatal 1>&2\r\nexit /b 42\r\n",
+        )
+        .unwrap();
+
+        // 1. VVIS fails with code 7 -> returns Err with stage & code, preserves old BSP
+        let tools_vvis_fail = ToolPaths {
+            studiomdl: std::path::PathBuf::new(),
+            vtfcmd: std::path::PathBuf::new(),
+            vbsp: vbsp_cmd.clone(),
+            vvis: vvis_fail,
+            vrad: vrad_cpu_retry_ok.clone(),
+            gmad: None,
+            game_dir: game_dir.clone(),
+            vanilla_jar: None,
+            hammer: None,
+            world_path: None,
+            scale_factor: 39.37,
+            max_convex_pieces: 2048,
+        };
+        let vvis_err = compile_bsp_map_cancellable(
+            &tools_vvis_fail,
+            &vmf_path,
+            "gm_test",
+            &addon_dir,
+            true,
+            false,
+            false,
+            "minecraft",
+            None,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(vvis_err.contains("VVIS") && vvis_err.contains("7"), "got: {}", vvis_err);
+        assert_eq!(std::fs::read(&published_addon_bsp).unwrap(), old_bsp);
+        assert_eq!(std::fs::read(&published_game_bsp).unwrap(), old_bsp);
+
+        // 2. VRAD++ GPU pass fails -> CPU fallback succeeds -> published BSP updated
+        let tools_vrad_retry = ToolPaths {
+            vvis: vvis_ok.clone(),
+            vrad: vrad_cpu_retry_ok,
+            ..tools_vvis_fail.clone()
+        };
+        let mut retry_logs = Vec::new();
+        let ok_bsp = compile_bsp_map_cancellable(
+            &tools_vrad_retry,
+            &vmf_path,
+            "gm_test",
+            &addon_dir,
+            true,
+            false,
+            false,
+            "minecraft",
+            None,
+            |line| retry_logs.push(line.to_string()),
+        )
+        .unwrap();
+        assert_eq!(ok_bsp, published_game_bsp);
+        assert!(retry_logs.iter().any(|l| l.contains("retrying with -cpu fallback")));
+        assert!(std::fs::read_to_string(&published_addon_bsp).unwrap().contains("NEW_TEMP_BSP"));
+        assert!(std::fs::read_to_string(&published_game_bsp).unwrap().contains("NEW_TEMP_BSP"));
+
+        // 3. VRAD++ GPU + CPU fallback both fail with code 42 -> Err with stage & code, preserves old BSP
+        std::fs::write(&published_addon_bsp, old_bsp).unwrap();
+        std::fs::write(&published_game_bsp, old_bsp).unwrap();
+        let tools_vrad_fail = ToolPaths {
+            vvis: vvis_ok,
+            vrad: vrad_always_fail,
+            ..tools_vvis_fail
+        };
+        let vrad_err = compile_bsp_map_cancellable(
+            &tools_vrad_fail,
+            &vmf_path,
+            "gm_test",
+            &addon_dir,
+            true,
+            false,
+            false,
+            "minecraft",
+            None,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            vrad_err.contains("VRAD++") && vrad_err.contains("42"),
+            "got: {}",
+            vrad_err
+        );
+        assert_eq!(std::fs::read(&published_addon_bsp).unwrap(), old_bsp);
+        assert_eq!(std::fs::read(&published_game_bsp).unwrap(), old_bsp);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_gui_launch_coords_error_disables_autostart_and_preserves_missing_coords() {
+        use clap::{CommandFactory, FromArgMatches};
+
+        // 1. Typo in coordinate number
+        let m_typo = CliArgs::command()
+            .try_get_matches_from(["mcgm", "--gui", "--auto-start", "--coords", "0", "64", "0", "10", "70", "abc"])
+            .unwrap();
+        let a_typo = CliArgs::from_arg_matches(&m_typo).unwrap();
+        let cfg_typo = crate::build_gui_launch_config(&a_typo, &m_typo);
+        assert!(!cfg_typo.auto_start, "auto_start must stop when --coords has a typo");
+        assert!(cfg_typo.coords.is_none());
+        assert!(cfg_typo.startup_error.as_deref().unwrap_or("").contains("abc"));
+
+        // 2. Incomplete coordinate count
+        let m_inc = CliArgs::command()
+            .try_get_matches_from(["mcgm", "--gui", "--auto-start", "--coords", "0", "64", "0", "10"])
+            .unwrap();
+        let a_inc = CliArgs::from_arg_matches(&m_inc).unwrap();
+        let cfg_inc = crate::build_gui_launch_config(&a_inc, &m_inc);
+        assert!(!cfg_inc.auto_start, "auto_start must stop when --coords is incomplete");
+        assert!(cfg_inc.coords.is_none());
+        assert!(cfg_inc.startup_error.as_deref().unwrap_or("").contains("got 4"));
+
+        // 3. Omitted --coords preserves normal selection / auto_start
+        let m_none = CliArgs::command()
+            .try_get_matches_from(["mcgm", "--gui", "--auto-start"])
+            .unwrap();
+        let a_none = CliArgs::from_arg_matches(&m_none).unwrap();
+        let cfg_none = crate::build_gui_launch_config(&a_none, &m_none);
+        assert!(cfg_none.auto_start);
+        assert!(cfg_none.coords.is_none());
+        assert!(cfg_none.startup_error.is_none());
+    }
+
+    #[test]
+    fn test_gui_launch_explicit_cli_overrides_pipeline_options() {
+        use crate::gui::{resolve_gui_pipeline_options, PersistedGuiState};
+        use clap::{CommandFactory, FromArgMatches};
+
+        let matches = CliArgs::command()
+            .try_get_matches_from([
+                "mcgm",
+                "--gui",
+                "--auto-start",
+                "--chunk-size",
+                "16",
+                "--max-workers",
+                "1",
+                "--max-convex",
+                "48",
+                "--reuse-cache",
+            ])
+            .unwrap();
+        let args = CliArgs::from_arg_matches(&matches).unwrap();
+        let cfg = crate::build_gui_launch_config(&args, &matches);
+        assert_eq!(cfg.chunk_size, Some(16));
+        assert_eq!(cfg.max_workers, Some(1));
+        assert_eq!(cfg.max_convex, Some(48));
+        assert_eq!(cfg.reuse_cache, Some(true));
+        assert!(cfg.auto_start);
+
+        let saved = PersistedGuiState {
+            build_preset: Some("balanced".to_string()),
+            name: Some("saved_name".to_string()),
+            ..Default::default()
+        };
+        let opts = resolve_gui_pipeline_options(Some(&saved), &cfg);
+        assert_eq!(opts.chunk_size, 16);
+        assert_eq!(opts.max_workers, 1);
+        assert_eq!(opts.max_convex, 48);
+        assert!(opts.reuse_cache);
+    }
+
+    #[test]
+    fn test_max_convex_pieces_config_priority_and_qc_splitting() {
+        use crate::compiler::{load_tool_paths, DEFAULT_MAX_CONVEX_PIECES};
+
+        let tmp = make_temp_test_dir("max_convex_cfg");
+        let cfg_4 = tmp.join("config_4.json");
+        let cfg_64 = tmp.join("config_64.json");
+        let cfg_empty = tmp.join("config_empty.json");
+        std::fs::write(&cfg_4, r#"{"max_convex_pieces": 4}"#).unwrap();
+        std::fs::write(&cfg_64, r#"{"max_convex_pieces": 64}"#).unwrap();
+        std::fs::write(&cfg_empty, r#"{}"#).unwrap();
+
+        let t4 = load_tool_paths(Some(&cfg_4));
+        let t64 = load_tool_paths(Some(&cfg_64));
+        let tdef = load_tool_paths(Some(&cfg_empty));
+        assert_eq!(t4.max_convex_pieces, 4);
+        assert_eq!(t64.max_convex_pieces, 64);
+        assert_eq!(tdef.max_convex_pieces, DEFAULT_MAX_CONVEX_PIECES);
+
+        // Priority: explicit CLI > config.json > default (2048)
+        assert_eq!(crate::resolve_effective_max_convex(12, t4.max_convex_pieces), 12);
+        assert_eq!(crate::resolve_effective_max_convex(0, t4.max_convex_pieces), 4);
+        assert_eq!(crate::resolve_effective_max_convex(0, t64.max_convex_pieces), 64);
+        assert_eq!(crate::resolve_effective_max_convex(0, 0), 2048);
+
+        let cm = crate::mesher::ChunkMesh {
+            cx: 0,
+            cz: 0,
+            name: "chunk_0_0".to_string(),
+            origin_source: [0.0; 3],
+            bounds_min: [0.0; 3],
+            bounds_max: [275.59, 39.37, 39.37],
+            solid_tris: vec![MeshTri {
+                material: "terrain_opaque".into(),
+                pos: [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+                norm: [[0.0, 0.0, 1.0]; 3],
+                uv: [[0.0, 0.0]; 3],
+            }],
+            translucent_tris: Vec::new(),
+            has_cutout: false,
+        };
+        let boxes: Vec<CollisionBox> = (0..7)
+            .map(|i| CollisionBox {
+                box_coords: [i as f64 * 39.37, 0.0, 0.0, (i + 1) as f64 * 39.37, 39.37, 39.37],
+                block_class: "full".into(),
+                is_walkable: true,
+                is_opaque_roof: true,
+                surface_prop: SurfaceProp::Rock,
+            })
+            .collect();
+        let eff_max = crate::resolve_effective_max_convex(0, t4.max_convex_pieces);
+        let art = emit_chunk_smds_and_qcs(&cm, &boxes, &tmp.join("smd"), "custom_mc", eff_max, "convex_map").unwrap();
+        let main_qc = std::fs::read_to_string(&art.qc_path).unwrap();
+        assert!(main_qc.contains("$maxconvexpieces 4"), "QC must use config max_convex_pieces=4, got:\n{}", main_qc);
+        assert_eq!(art.extra_collision_models.len(), 1, "7 boxes at max=4 must split into 4+3");
+        let extra_qc = std::fs::read_to_string(&art.extra_collision_models[0].0).unwrap();
+        assert!(extra_qc.contains("$maxconvexpieces 4"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_reuse_cache_invalidates_atlas_and_vtf_when_jar_png_changes() {
+        use crate::atlas::compute_atlas_cache_hash_with_assets;
+        use crate::compiler::{compile_materials, ToolPaths};
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let tmp = make_temp_test_dir("reuse_cache_jar_png");
+        let jar_path = tmp.join("client.jar");
+        let work_dir = tmp.join("work");
+        let addon_dir = tmp.join("addon");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::create_dir_all(&addon_dir).unwrap();
+
+        let write_jar = |color: [u8; 4]| {
+            let f = std::fs::File::create(&jar_path).unwrap();
+            let mut zw = ZipWriter::new(f);
+            let opts = SimpleFileOptions::default();
+            zw.start_file("assets/minecraft/textures/block/stone.png", opts).unwrap();
+            let img = ImageBuffer::from_pixel(16, 16, Rgba(color));
+            zw.write_all(&encode_png_bytes(&img)).unwrap();
+            zw.start_file("version.json", opts).unwrap();
+            zw.write_all(br#"{"world_version": 3465}"#).unwrap();
+            zw.finish().unwrap();
+        };
+
+        let calls_log = tmp.join("vtf_calls.txt");
+        let mock_vtfcmd = tmp.join("mock_vtfcmd.cmd");
+        std::fs::write(
+            &mock_vtfcmd,
+            format!(
+                "@echo off\r\necho %~n2>>\"{}\"\r\ncopy /y \"%~2\" \"%~4\\%~n2.vtf\" >nul\r\n",
+                calls_log.display()
+            ),
+        )
+        .unwrap();
+
+        let tools = ToolPaths {
+            studiomdl: std::path::PathBuf::new(),
+            vtfcmd: mock_vtfcmd,
+            vbsp: std::path::PathBuf::new(),
+            vvis: std::path::PathBuf::new(),
+            vrad: std::path::PathBuf::new(),
+            gmad: None,
+            game_dir: std::path::PathBuf::new(),
+            vanilla_jar: None,
+            hammer: None,
+            world_path: None,
+            scale_factor: 39.37,
+            max_convex_pieces: 2048,
+        };
+
+        let mut reqs = HashSet::new();
+        reqs.insert(TexRequestKey {
+            tex_ref: "minecraft:block/stone".to_string(),
+            tint_rgb: None,
+        });
+
+        // 1. Initial JAR with red stone.png
+        write_jar([230, 10, 10, 255]);
+        let assets1 = AssetIndex::discover_and_load(Some(&jar_path), None, &[]);
+        let h1 = compute_atlas_cache_hash_with_assets(&reqs, &assets1, 39.37, "minecraft", 8);
+        let atlas1 = build_texture_atlas(&reqs, &assets1, 8);
+        let atlas_png_1 = work_dir.join(format!("atlas_{}.png", h1));
+        let sign_png = work_dir.join("sign_atlas.png");
+        crate::atlas::save_png_fast(&atlas1.image, &atlas_png_1).unwrap();
+        crate::atlas::save_png_fast(&ImageBuffer::new(16, 16), &sign_png).unwrap();
+        compile_materials(&tools, "custom_mc", &atlas_png_1, &sign_png, &HashMap::new(), &[], &addon_dir, false, true).unwrap();
+
+        // 2. Identical JAR -> same hash & VTF cache hit (VTFCmd skipped for atlas)
+        let _ = std::fs::remove_file(&calls_log);
+        let assets1_rep = AssetIndex::discover_and_load(Some(&jar_path), None, &[]);
+        let h1_rep = compute_atlas_cache_hash_with_assets(&reqs, &assets1_rep, 39.37, "minecraft", 8);
+        assert_eq!(h1_rep, h1);
+        compile_materials(&tools, "custom_mc", &atlas_png_1, &sign_png, &HashMap::new(), &[], &addon_dir, false, true).unwrap();
+        let rep_log = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert!(!rep_log.contains(&format!("atlas_{}", h1)), "identical assets must reuse cached VTF");
+
+        // 3. Replace stone.png bytes in JAR under same name with blue pixels -> new hash, new atlas, new VTF
+        let _ = std::fs::remove_file(&calls_log);
+        write_jar([10, 30, 240, 255]);
+        let assets2 = AssetIndex::discover_and_load(Some(&jar_path), None, &[]);
+        let h2 = compute_atlas_cache_hash_with_assets(&reqs, &assets2, 39.37, "minecraft", 8);
+        assert_ne!(h2, h1, "changing PNG bytes in JAR must invalidate atlas cache hash");
+        let atlas2 = build_texture_atlas(&reqs, &assets2, 8);
+        let has_blue = atlas2.image.pixels().any(|p| p[2] > 200 && p[0] < 50);
+        assert!(has_blue, "new atlas must contain updated blue pixels");
+        let atlas_png_2 = work_dir.join(format!("atlas_{}.png", h2));
+        crate::atlas::save_png_fast(&atlas2.image, &atlas_png_2).unwrap();
+        compile_materials(&tools, "custom_mc", &atlas_png_2, &sign_png, &HashMap::new(), &[], &addon_dir, false, true).unwrap();
+        let log2 = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert!(log2.contains(&format!("atlas_{}", h2)), "changed PNG must invoke VTFCmd for new atlas");
+
+        // 4. Even if PNG path has the same filename, changing its bytes invalidates .vtf.src_hash
+        let _ = std::fs::remove_file(&calls_log);
+        crate::atlas::save_png_fast(&atlas2.image, &atlas_png_1).unwrap();
+        compile_materials(&tools, "custom_mc", &atlas_png_1, &sign_png, &HashMap::new(), &[], &addon_dir, false, true).unwrap();
+        let log3 = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert!(log3.contains(&format!("atlas_{}", h1)), "vtf.src_hash mismatch must re-run VTFCmd");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_custom_dimension_passthrough_gui_and_anvil_region_dir() {
+        use crate::anvil::resolve_dimension_region_dir;
+        use crate::gui::resolve_gui_pipeline_options;
+        use clap::{CommandFactory, FromArgMatches};
+
+        let tmp = make_temp_test_dir("custom_dim_passthrough");
+        let ov_reg = tmp.join("region");
+        let neth_reg = tmp.join("DIM-1/region");
+        let end_reg = tmp.join("DIM1/region");
+        let moon_reg = tmp.join("dimensions/mymod/moon/region");
+        let nested_reg = tmp.join("dimensions/mymod/outer/rim/region");
+        std::fs::create_dir_all(&ov_reg).unwrap();
+        std::fs::create_dir_all(&neth_reg).unwrap();
+        std::fs::create_dir_all(&end_reg).unwrap();
+        std::fs::create_dir_all(&moon_reg).unwrap();
+        std::fs::create_dir_all(&nested_reg).unwrap();
+
+        assert_eq!(resolve_dimension_region_dir(&tmp, "overworld").unwrap(), ov_reg);
+        assert_eq!(resolve_dimension_region_dir(&tmp, "nether").unwrap(), neth_reg);
+        assert_eq!(resolve_dimension_region_dir(&tmp, "end").unwrap(), end_reg);
+        assert_eq!(resolve_dimension_region_dir(&tmp, "mymod:moon").unwrap(), moon_reg);
+        assert_eq!(resolve_dimension_region_dir(&tmp, "mymod:outer/rim").unwrap(), nested_reg);
+
+        let matches = CliArgs::command()
+            .try_get_matches_from(["mcgm", "--gui", "--dimension", "mymod:moon"])
+            .unwrap();
+        let args = CliArgs::from_arg_matches(&matches).unwrap();
+        let cfg = crate::build_gui_launch_config(&args, &matches);
+        assert_eq!(cfg.dimension.as_deref(), Some("mymod:moon"));
+        let opts = resolve_gui_pipeline_options(None, &cfg);
+        assert_eq!(opts.dimension, "mymod:moon");
+        assert_eq!(resolve_dimension_region_dir(&tmp, &opts.dimension).unwrap(), moon_reg);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

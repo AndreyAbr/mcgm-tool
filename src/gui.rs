@@ -356,6 +356,12 @@ pub struct GuiLaunchConfig {
     pub export_vmf: Option<bool>,
     pub import_to_gmod: Option<bool>,
     pub force_vmf_brushes: Option<bool>,
+    pub chunk_size: Option<usize>,
+    pub max_workers: Option<usize>,
+    pub max_convex: Option<usize>,
+    pub reuse_cache: Option<bool>,
+    pub debug_log: Option<PathBuf>,
+    pub startup_error: Option<String>,
     pub auto_start: bool,
     pub lang: Option<UiLang>,
 }
@@ -530,37 +536,37 @@ pub fn format_selection_summary(lang: UiLang, coords: Option<[i32; 6]>) -> Strin
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct PersistedGuiState {
-    lang: Option<String>,
-    world_dir: Option<String>,
-    min_x: Option<i32>,
-    min_y: Option<i32>,
-    min_z: Option<i32>,
-    max_x: Option<i32>,
-    max_y: Option<i32>,
-    max_z: Option<i32>,
-    dimension: Option<String>,
-    name: Option<String>,
-    category: Option<String>,
-    map_name: Option<String>,
-    output_dir: Option<String>,
-    lighting_style: Option<String>,
-    scale: Option<String>,
-    build_preset: Option<String>,
-    import_to_gmod: Option<bool>,
-    export_vmf: Option<bool>,
-    hq_light: Option<bool>,
-    fast_vrad: Option<bool>,
-    mc_physics: Option<bool>,
-    force_vmf_brushes: Option<bool>,
+pub(crate) struct PersistedGuiState {
+    pub(crate) lang: Option<String>,
+    pub(crate) world_dir: Option<String>,
+    pub(crate) min_x: Option<i32>,
+    pub(crate) min_y: Option<i32>,
+    pub(crate) min_z: Option<i32>,
+    pub(crate) max_x: Option<i32>,
+    pub(crate) max_y: Option<i32>,
+    pub(crate) max_z: Option<i32>,
+    pub(crate) dimension: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) category: Option<String>,
+    pub(crate) map_name: Option<String>,
+    pub(crate) output_dir: Option<String>,
+    pub(crate) lighting_style: Option<String>,
+    pub(crate) scale: Option<String>,
+    pub(crate) build_preset: Option<String>,
+    pub(crate) import_to_gmod: Option<bool>,
+    pub(crate) export_vmf: Option<bool>,
+    pub(crate) hq_light: Option<bool>,
+    pub(crate) fast_vrad: Option<bool>,
+    pub(crate) mc_physics: Option<bool>,
+    pub(crate) force_vmf_brushes: Option<bool>,
     #[serde(default)]
-    show_advanced: Option<bool>,
+    pub(crate) show_advanced: Option<bool>,
     #[serde(default)]
-    show_log: Option<bool>,
+    pub(crate) show_log: Option<bool>,
     #[serde(default)]
-    selected_instance_saves: Option<String>,
+    pub(crate) selected_instance_saves: Option<String>,
     #[serde(default)]
-    custom_instance_dirs: Vec<String>,
+    pub(crate) custom_instance_dirs: Vec<String>,
 }
 
 pub fn detect_default_language() -> UiLang {
@@ -910,6 +916,12 @@ struct GuiState {
     last_auto_map_name: Option<String>,
     model_name_manually_edited: bool,
     suppress_name_sync: bool,
+    cli_chunk_size: Option<usize>,
+    cli_max_workers: Option<usize>,
+    cli_max_convex: Option<usize>,
+    cli_reuse_cache: Option<bool>,
+    cli_debug_log: Option<PathBuf>,
+    custom_dimension: Option<String>,
 }
 
 type PendingLogBatch = (i32, Option<String>, Vec<String>);
@@ -1413,28 +1425,88 @@ fn create_control(
     }
 }
 
-fn normalize_dimension_str(dim: &str) -> &'static str {
-    let low = dim.trim().to_ascii_lowercase();
+pub fn normalize_dimension_id(dim: &str) -> String {
+    let trimmed = dim.trim();
+    if trimmed.is_empty() {
+        return "overworld".to_string();
+    }
+    let low = trimmed.to_ascii_lowercase();
     match low.as_str() {
-        "nether" | "the_nether" | "minecraft:the_nether" | "-1" | "dim-1" | "dim_nether" => "nether",
-        "end" | "the_end" | "minecraft:the_end" | "1" | "dim1" | "dim_end" => "end",
-        _ => "overworld",
+        "overworld" | "minecraft:overworld" | "0" | "dim0" | "dim_overworld" => {
+            "overworld".to_string()
+        }
+        "nether" | "the_nether" | "minecraft:the_nether" | "-1" | "dim-1" | "dim_nether" => {
+            "nether".to_string()
+        }
+        "end" | "the_end" | "minecraft:the_end" | "1" | "dim1" | "dim_end" => "end".to_string(),
+        _ => low,
     }
 }
 
-fn dim_index_from_str(dim: &str) -> usize {
-    match normalize_dimension_str(dim) {
+fn dimension_combo_entries(lang: UiLang, custom_dim: Option<&str>) -> Vec<String> {
+    let mut labels = vec![
+        tr_text(lang, "dim_overworld").to_string(),
+        tr_text(lang, "dim_nether").to_string(),
+        tr_text(lang, "dim_end").to_string(),
+    ];
+    if let Some(custom) = custom_dim {
+        let norm = normalize_dimension_id(custom);
+        if !matches!(norm.as_str(), "overworld" | "nether" | "end") {
+            labels.push(norm);
+        }
+    }
+    labels
+}
+
+fn dim_index_from_str(dim: &str, custom_dim: Option<&str>) -> usize {
+    let norm = normalize_dimension_id(dim);
+    match norm.as_str() {
+        "overworld" => 0,
         "nether" => 1,
         "end" => 2,
-        _ => 0,
+        _ => {
+            if custom_dim.is_some_and(|c| normalize_dimension_id(c) == norm) {
+                3
+            } else {
+                0
+            }
+        }
     }
 }
 
-fn dim_str_from_index(idx: isize) -> &'static str {
+fn dim_str_from_index(idx: isize, custom_dim: Option<&str>) -> String {
     match idx {
-        1 => "nether",
-        2 => "end",
-        _ => "overworld",
+        1 => "nether".to_string(),
+        2 => "end".to_string(),
+        3 => custom_dim
+            .map(normalize_dimension_id)
+            .filter(|d| !matches!(d.as_str(), "overworld" | "nether" | "end"))
+            .unwrap_or_else(|| "overworld".to_string()),
+        _ => "overworld".to_string(),
+    }
+}
+
+fn set_dim_combo_value(dim: &str, lang: UiLang) {
+    let norm = normalize_dimension_id(dim);
+    let is_custom = !matches!(norm.as_str(), "overworld" | "nether" | "end");
+    let custom_opt = if is_custom {
+        if let Some(lock) = GUI_STATE.get() {
+            if let Ok(mut st) = lock.lock() {
+                st.custom_dimension = Some(norm.clone());
+            }
+        }
+        Some(norm.clone())
+    } else {
+        GUI_STATE
+            .get()
+            .and_then(|l| l.lock().ok())
+            .and_then(|st| st.custom_dimension.clone())
+    };
+    if let Some(hd) = get_ctrl_hwnd(ID_COMBO_DIM) {
+        let labels = dimension_combo_entries(lang, custom_opt.as_deref());
+        let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+        let sel_idx = dim_index_from_str(&norm, custom_opt.as_deref());
+        repopulate_combo(hd, &label_refs, sel_idx);
     }
 }
 
@@ -1579,15 +1651,13 @@ fn apply_language(lang: UiLang, busy: bool, status_key: &'static str, custom_sta
     }
     if let Some(&hd) = handles.controls.get(&ID_COMBO_DIM) {
         let cur = unsafe { SendMessageW(hd as HWND, CB_GETCURSEL, 0, 0) }.max(0) as usize;
-        repopulate_combo(
-            hd,
-            &[
-                tr_text(lang, "dim_overworld"),
-                tr_text(lang, "dim_nether"),
-                tr_text(lang, "dim_end"),
-            ],
-            cur,
-        );
+        let custom_dim = GUI_STATE
+            .get()
+            .and_then(|l| l.try_lock().ok())
+            .and_then(|s| s.custom_dimension.clone());
+        let labels = dimension_combo_entries(lang, custom_dim.as_deref());
+        let label_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+        repopulate_combo(hd, &label_refs, cur);
     }
     if let Some(&hl) = handles.controls.get(&ID_COMBO_LIGHT) {
         let cur = unsafe { SendMessageW(hl as HWND, CB_GETCURSEL, 0, 0) }.max(0) as usize;
@@ -2140,7 +2210,7 @@ fn collect_persisted_state() -> PersistedGuiState {
     let get_i = |id: i32| -> Option<i32> { get_s(id).parse::<i32>().ok() };
     let get_chk = |id: i32| -> bool { get_ctrl_hwnd(id).map(get_chk_state).unwrap_or(false) };
 
-    let (lang, preset, layout_mode, selected_instance_saves, custom_instance_dirs) = GUI_STATE
+    let (lang, preset, layout_mode, selected_instance_saves, custom_instance_dirs, custom_dim) = GUI_STATE
         .get()
         .and_then(|l| l.lock().ok())
         .map(|s| {
@@ -2160,6 +2230,7 @@ fn collect_persisted_state() -> PersistedGuiState {
                 s.layout_mode,
                 sel_saves,
                 custom_dirs,
+                s.custom_dimension.clone(),
             )
         })
         .unwrap_or((
@@ -2168,6 +2239,7 @@ fn collect_persisted_state() -> PersistedGuiState {
             GuiLayoutMode::default(),
             None,
             Vec::new(),
+            None,
         ));
 
     let dim_idx = get_ctrl_hwnd(ID_COMBO_DIM)
@@ -2186,7 +2258,7 @@ fn collect_persisted_state() -> PersistedGuiState {
         max_x: get_i(ID_EDIT_COORD_X2),
         max_y: get_i(ID_EDIT_COORD_Y2),
         max_z: get_i(ID_EDIT_COORD_Z2),
-        dimension: Some(dim_str_from_index(dim_idx).to_string()),
+        dimension: Some(dim_str_from_index(dim_idx, custom_dim.as_deref())),
         name: Some(get_s(ID_EDIT_NAME)),
         category: Some(get_s(ID_EDIT_CAT)),
         map_name: Some(get_s(ID_EDIT_MAP)),
@@ -2219,6 +2291,214 @@ fn load_persisted_state() -> Option<PersistedGuiState> {
     let path = resolve_gui_state_load_path()?;
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str::<PersistedGuiState>(&text).ok()
+}
+
+pub fn apply_cli_overrides_to_pipeline_options(
+    opts: &mut PipelineOptions,
+    chunk_size: Option<usize>,
+    max_workers: Option<usize>,
+    max_convex: Option<usize>,
+    reuse_cache: Option<bool>,
+    debug_log: Option<PathBuf>,
+    build_preset: &str,
+) {
+    if let Some(cs) = chunk_size {
+        opts.chunk_size = cs;
+    }
+    if let Some(mw) = max_workers {
+        opts.max_workers = mw;
+    }
+    if let Some(mc) = max_convex {
+        opts.max_convex = mc;
+    }
+    opts.reuse_cache = reuse_cache.unwrap_or_else(|| build_preset == "preview");
+    if let Some(dl) = debug_log {
+        opts.debug_log = Some(dl);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_gui_pipeline_options(
+    saved: Option<&PersistedGuiState>,
+    cfg: &GuiLaunchConfig,
+) -> PipelineOptions {
+    let mut opts = PipelineOptions {
+        name: "mc_custom".to_string(),
+        category: "custom_mc".to_string(),
+        map_name: "gm_mc_custom".to_string(),
+        coords: crate::anvil::WorldCoords {
+            min_x: -50,
+            min_y: -64,
+            min_z: -50,
+            max_x: 50,
+            max_y: 128,
+            max_z: 50,
+        },
+        ..Default::default()
+    };
+    if let Some(ps) = saved {
+        if let Some(ref wd) = ps.world_dir {
+            if !wd.is_empty() {
+                opts.world_dir = PathBuf::from(wd);
+            }
+        }
+        if let (Some(x1), Some(y1), Some(z1), Some(x2), Some(y2), Some(z2)) =
+            (ps.min_x, ps.min_y, ps.min_z, ps.max_x, ps.max_y, ps.max_z)
+        {
+            opts.coords = crate::anvil::WorldCoords {
+                min_x: x1,
+                min_y: y1,
+                min_z: z1,
+                max_x: x2,
+                max_y: y2,
+                max_z: z2,
+            }
+            .normalized();
+        }
+        if let Some(ref dim) = ps.dimension {
+            opts.dimension = normalize_dimension_id(dim);
+        }
+        if let Some(ref n) = ps.name {
+            if !n.is_empty() {
+                opts.name = n.clone();
+            }
+        }
+        if let Some(ref c) = ps.category {
+            if !c.is_empty() {
+                opts.category = c.clone();
+            }
+        }
+        if let Some(ref m) = ps.map_name {
+            if !m.is_empty() {
+                opts.map_name = m.clone();
+            }
+        }
+        if let Some(ref o) = ps.output_dir {
+            if !o.is_empty() {
+                opts.output_dir = PathBuf::from(o);
+            }
+        }
+        if let Some(ref l) = ps.lighting_style {
+            opts.lighting_style = l.clone();
+        }
+        if let Some(ref sc) = ps.scale {
+            if let Ok(v) = sc.replace(',', ".").parse::<f64>() {
+                if v.is_finite() && v > 0.0 {
+                    opts.scale = v;
+                }
+            }
+        }
+        if let Some(v) = ps.import_to_gmod {
+            opts.import_to_gmod = v;
+        }
+        if let Some(v) = ps.export_vmf {
+            opts.export_vmf = v;
+        }
+        if let Some(v) = ps.hq_light {
+            opts.hq_light = v;
+        }
+        if let Some(v) = ps.fast_vrad {
+            opts.fast_vrad = v;
+        }
+        if let Some(v) = ps.mc_physics {
+            opts.mc_physics = v;
+        }
+        if let Some(v) = ps.force_vmf_brushes {
+            opts.force_vmf_brushes = v;
+        }
+        if let Some(ref p) = ps.build_preset {
+            match p.trim().to_ascii_lowercase().as_str() {
+                "preview" => {
+                    opts.fast_vrad = true;
+                    opts.hq_light = false;
+                }
+                "balanced" => {
+                    opts.fast_vrad = false;
+                    opts.hq_light = false;
+                }
+                "hq" => {
+                    opts.fast_vrad = false;
+                    opts.hq_light = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(ref w) = cfg.world {
+        opts.world_dir = w.clone();
+    }
+    if let Some(c) = cfg.coords {
+        opts.coords = c.normalized();
+    }
+    if let Some(ref dim) = cfg.dimension {
+        opts.dimension = normalize_dimension_id(dim);
+    }
+    if let Some(ref n) = cfg.name {
+        opts.name = n.clone();
+        if cfg.map_name.is_none() {
+            opts.map_name = if n.starts_with("gm_") {
+                n.clone()
+            } else {
+                format!("gm_{}", n)
+            };
+        }
+    }
+    if let Some(ref cat) = cfg.category {
+        opts.category = cat.clone();
+    }
+    if let Some(ref m) = cfg.map_name {
+        opts.map_name = m.clone();
+    }
+    if let Some(ref o) = cfg.output_dir {
+        opts.output_dir = o.clone();
+    }
+    if let Some(ref l) = cfg.lighting_style {
+        opts.lighting_style = l.clone();
+    }
+    if let Some(sc) = cfg.scale {
+        if sc.is_finite() && sc > 0.0 {
+            opts.scale = sc;
+        }
+    }
+    if let Some(v) = cfg.import_to_gmod {
+        opts.import_to_gmod = v;
+    }
+    if let Some(v) = cfg.export_vmf {
+        opts.export_vmf = v;
+    }
+    if let Some(v) = cfg.hq_light {
+        opts.hq_light = v;
+    }
+    if let Some(v) = cfg.fast_vrad {
+        opts.fast_vrad = v;
+    }
+    if let Some(v) = cfg.mc_physics {
+        opts.mc_physics = v;
+    }
+    if let Some(v) = cfg.force_vmf_brushes {
+        opts.force_vmf_brushes = v;
+    }
+    if let Some(ref cp) = cfg.config_path {
+        opts.config_path = Some(cp.clone());
+    }
+
+    let derived_preset = match (opts.fast_vrad, opts.hq_light) {
+        (true, false) => "preview",
+        (false, false) => "balanced",
+        (false, true) => "hq",
+        (true, true) => "custom",
+    };
+    apply_cli_overrides_to_pipeline_options(
+        &mut opts,
+        cfg.chunk_size,
+        cfg.max_workers,
+        cfg.max_convex,
+        cfg.reuse_cache,
+        cfg.debug_log.clone(),
+        derived_preset,
+    );
+    opts
 }
 
 fn validate_and_build_options(lang: UiLang, config_path: Option<PathBuf>) -> Result<PipelineOptions, String> {
@@ -2350,13 +2630,23 @@ fn validate_and_build_options(lang: UiLang, config_path: Option<PathBuf>) -> Res
     let light_idx = get_ctrl_hwnd(ID_COMBO_LIGHT)
         .map(|h| unsafe { SendMessageW(h as HWND, CB_GETCURSEL, 0, 0) })
         .unwrap_or(0);
-    let reuse_cache = GUI_STATE
+    let (build_preset, custom_dim, cli_cs, cli_mw, cli_mc, cli_rc, cli_dl) = GUI_STATE
         .get()
         .and_then(|l| l.lock().ok())
-        .map(|st| st.build_preset == "preview")
-        .unwrap_or(false);
+        .map(|st| {
+            (
+                st.build_preset.clone(),
+                st.custom_dimension.clone(),
+                st.cli_chunk_size,
+                st.cli_max_workers,
+                st.cli_max_convex,
+                st.cli_reuse_cache,
+                st.cli_debug_log.clone(),
+            )
+        })
+        .unwrap_or_else(|| ("balanced".to_string(), None, None, None, None, None, None));
 
-    Ok(PipelineOptions {
+    let mut opts = PipelineOptions {
         world_dir: PathBuf::from(&world_s),
         coords: crate::anvil::WorldCoords {
             min_x,
@@ -2367,7 +2657,7 @@ fn validate_and_build_options(lang: UiLang, config_path: Option<PathBuf>) -> Res
             max_z,
         }
         .normalized(),
-        dimension: dim_str_from_index(dim_idx).to_string(),
+        dimension: dim_str_from_index(dim_idx, custom_dim.as_deref()),
         name,
         category: cat,
         map_name,
@@ -2381,9 +2671,18 @@ fn validate_and_build_options(lang: UiLang, config_path: Option<PathBuf>) -> Res
         mc_physics: get_chk(ID_CHK_MC_PHYSICS),
         force_vmf_brushes: get_chk(ID_CHK_VMF_BRUSHES),
         scale,
-        reuse_cache,
         ..Default::default()
-    })
+    };
+    apply_cli_overrides_to_pipeline_options(
+        &mut opts,
+        cli_cs,
+        cli_mw,
+        cli_mc,
+        cli_rc,
+        cli_dl,
+        &build_preset,
+    );
+    Ok(opts)
 }
 
 /// Formats a caught panic payload into a human-readable error string.
@@ -2400,11 +2699,16 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 pub fn format_done_summary(lang: UiLang, summary: &crate::PipelineSummary) -> String {
     match lang {
         UiLang::Ru => {
-            let gma_line = summary
-                .gma_path
-                .as_ref()
-                .map(|p| format!("\nGMA-аддон: {}", p.display()))
-                .unwrap_or_default();
+            let gma_line = if let Some(ref p) = summary.gma_path {
+                format!("\nGMA-аддон: {}", p.display())
+            } else if let Some(ref err) = summary.gma_error {
+                format!(
+                    "\nПредупреждение: BSP собран, но создать новый GMA не удалось: {}",
+                    err
+                )
+            } else {
+                String::new()
+            };
             format!(
                 "Готово за {:.2}с! BSP: {}{}\nЧанки: {}, Двери: {}",
                 summary.total_secs,
@@ -2415,11 +2719,16 @@ pub fn format_done_summary(lang: UiLang, summary: &crate::PipelineSummary) -> St
             )
         }
         UiLang::En => {
-            let gma_line = summary
-                .gma_path
-                .as_ref()
-                .map(|p| format!("\nGMA Addon: {}", p.display()))
-                .unwrap_or_default();
+            let gma_line = if let Some(ref p) = summary.gma_path {
+                format!("\nGMA Addon: {}", p.display())
+            } else if let Some(ref err) = summary.gma_error {
+                format!(
+                    "\nWarning: BSP compiled, but failed to create new GMA addon: {}",
+                    err
+                )
+            } else {
+                String::new()
+            };
             format!(
                 "Done in {:.2}s! BSP: {}{}\nChunks: {}, Doors: {}",
                 summary.total_secs,
@@ -2533,11 +2842,14 @@ fn handle_start_clicked() {
                     })
                 }))
                 .unwrap_or_else(|panic_payload| Err(panic_message(panic_payload)));
-                let msg_res = if cancel_flag_final.load(Ordering::SeqCst) {
+                let msg_res: Result<(String, bool), String> = if cancel_flag_final.load(Ordering::SeqCst) {
                     Err("__CANCELLED__".to_string())
                 } else {
                     match outcome {
-                        Ok(summary) => Ok(format_done_summary(lang, &summary)),
+                        Ok(summary) => {
+                            let has_warning = summary.gma_error.is_some();
+                            Ok((format_done_summary(lang, &summary), has_warning))
+                        }
                         Err(e) => Err(e),
                     }
                 };
@@ -3336,7 +3648,7 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_DONE => {
             KillTimer(hwnd, ID_TIMER_LOG);
             flush_pending_logs();
-            let res_ptr = lparam as *mut Result<String, String>;
+            let res_ptr = lparam as *mut Result<(String, bool), String>;
             if !res_ptr.is_null() {
                 let res = *Box::from_raw(res_ptr);
                 let (lang, cur_mode) = {
@@ -3366,7 +3678,7 @@ unsafe extern "system" fn wnd_proc(
 
                 // Prepare optional modal MessageBox parameters AFTER lock is dropped
                 let modal: Option<(String, String, u32)> = match res {
-                    Ok(msg) => {
+                    Ok((msg, has_warning)) => {
                         if let Some(hp) = get_ctrl_hwnd(ID_PROGRESS) {
                             SendMessageW(hp as HWND, PBM_SETPOS, 100, 0);
                         }
@@ -3379,7 +3691,11 @@ unsafe extern "system" fn wnd_proc(
                         Some((
                             tr_text(lang, "done_title").to_string(),
                             msg,
-                            MB_OK | MB_ICONINFORMATION,
+                            if has_warning {
+                                MB_OK | MB_ICONWARNING
+                            } else {
+                                MB_OK | MB_ICONINFORMATION
+                            },
                         ))
                     }
                     Err(ref err) if err == "__CANCELLED__" => {
@@ -3806,6 +4122,12 @@ pub fn run_gui_with_config(cfg: GuiLaunchConfig) -> Result<(), String> {
             last_auto_map_name: None,
             model_name_manually_edited: false,
             suppress_name_sync: false,
+            cli_chunk_size: cfg.chunk_size,
+            cli_max_workers: cfg.max_workers,
+            cli_max_convex: cfg.max_convex,
+            cli_reuse_cache: cfg.reuse_cache,
+            cli_debug_log: cfg.debug_log.clone(),
+            custom_dimension: None,
         }));
 
         apply_edit_margins(initial_dpi);
@@ -3834,9 +4156,7 @@ pub fn run_gui_with_config(cfg: GuiLaunchConfig) -> Result<(), String> {
                 has_world_or_coords = true;
             }
             if let Some(ref dim) = ps.dimension {
-                if let Some(hd) = get_ctrl_hwnd(ID_COMBO_DIM) {
-                    SendMessageW(hd as HWND, CB_SETCURSEL, dim_index_from_str(dim), 0);
-                }
+                set_dim_combo_value(dim, initial_lang);
             }
             if let Some(lock) = GUI_STATE.get() {
                 if let Ok(mut st) = lock.lock() {
@@ -3936,7 +4256,7 @@ pub fn run_gui_with_config(cfg: GuiLaunchConfig) -> Result<(), String> {
                 set_ctrl_text(hw, &w.to_string_lossy());
             }
             sync_worlds_combo(initial_lang, Some(w));
-            if cfg.coords.is_none() {
+            if cfg.coords.is_none() && cfg.startup_error.is_none() {
                 populate_from_world_path(w, true);
                 has_world_or_coords = true;
             }
@@ -3962,9 +4282,7 @@ pub fn run_gui_with_config(cfg: GuiLaunchConfig) -> Result<(), String> {
             has_world_or_coords = true;
         }
         if let Some(ref dim) = cfg.dimension {
-            if let Some(hd) = get_ctrl_hwnd(ID_COMBO_DIM) {
-                SendMessageW(hd as HWND, CB_SETCURSEL, dim_index_from_str(dim), 0);
-            }
+            set_dim_combo_value(dim, initial_lang);
         }
         if let Some(ref n) = cfg.name {
             if let Some(lock) = GUI_STATE.get() {
@@ -4053,9 +4371,36 @@ pub fn run_gui_with_config(cfg: GuiLaunchConfig) -> Result<(), String> {
         let _ = has_world_or_coords;
         sync_preset_from_checkboxes_ui();
         update_selection_info_label(initial_lang);
+        if let Some(ref err) = cfg.startup_error {
+            if let Some(lock) = GUI_STATE.get() {
+                if let Ok(mut st) = lock.lock() {
+                    st.status_key = "status_failed";
+                    st.custom_status_text = Some(err.clone());
+                }
+            }
+            if let Some(hl) = get_ctrl_hwnd(ID_LBL_STATUS) {
+                set_ctrl_text(hl, err);
+            }
+            if let Some(hlog) = get_ctrl_hwnd(ID_LOG) {
+                append_log_line(hlog, &format!("ERROR: {}", err));
+            }
+            if !initial_mode.show_log {
+                set_panel_mode(
+                    hwnd,
+                    GuiLayoutMode {
+                        show_advanced: initial_mode.show_advanced,
+                        show_log: true,
+                    },
+                );
+            }
+        }
         ShowWindow(hwnd, SW_SHOW);
 
-        if cfg.auto_start {
+        if let Some(ref err) = cfg.startup_error {
+            let wt = to_wide(tr_text(initial_lang, "err_title"));
+            let wm = to_wide(err);
+            MessageBoxW(hwnd, wm.as_ptr(), wt.as_ptr(), MB_OK | MB_ICONERROR);
+        } else if cfg.auto_start {
             PostMessageW(hwnd, WM_APP_AUTOSTART, 0, 0);
         }
 

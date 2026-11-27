@@ -37,6 +37,7 @@ public class Exporter {
     private static final Pattern PAT_MULTI_UNDERSCORE = Pattern.compile("_+");
     private static final Pattern PAT_WIN_RESERVED = Pattern.compile("^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$");
     private static final Pattern PAT_CAT_INVALID = Pattern.compile("[^a-zA-Z0-9_\\-/]");
+    private static final Pattern PAT_CUSTOM_DIM = Pattern.compile("^[a-z0-9_.-]+:[a-z0-9_./-]+$");
     private static final Pattern PAT_NOISY_SEP = Pattern.compile("^[=\\-_*]{4,}$");
     private static final Pattern PAT_PCT_START = Pattern.compile("^\\[\\d{1,3}%\\].*");
     private static final Pattern PAT_PCT_ANY = Pattern.compile(".*\\[\\d{1,3}%\\].*");
@@ -133,7 +134,15 @@ public class Exporter {
         String m = mode.trim().toLowerCase(Locale.ROOT);
         return switch (m) {
             case "auto", "overworld", "nether", "end" -> m;
-            default -> "auto";
+            case "minecraft:overworld" -> "overworld";
+            case "minecraft:the_nether", "the_nether" -> "nether";
+            case "minecraft:the_end", "the_end" -> "end";
+            default -> {
+                if (PAT_CUSTOM_DIM.matcher(m).matches() && !m.contains("..")) {
+                    yield m;
+                }
+                yield "auto";
+            }
         };
     }
 
@@ -367,7 +376,8 @@ public class Exporter {
         return new File(dir, "level.dat").isFile()
             || new File(dir, "region").isDirectory()
             || new File(dir, "DIM-1/region").isDirectory()
-            || new File(dir, "DIM1/region").isDirectory();
+            || new File(dir, "DIM1/region").isDirectory()
+            || new File(dir, "dimensions").isDirectory();
     }
 
     /**
@@ -391,6 +401,23 @@ public class Exporter {
         return "";
     }
 
+    public static String detectDimensionFromRegistryId(String registryId) {
+        if (registryId == null) {
+            return "overworld";
+        }
+        String norm = registryId.trim().toLowerCase(Locale.ROOT);
+        if (norm.isEmpty() || "minecraft:overworld".equals(norm) || "overworld".equals(norm)) {
+            return "overworld";
+        }
+        if ("minecraft:the_nether".equals(norm) || "nether".equals(norm) || "the_nether".equals(norm)) {
+            return "nether";
+        }
+        if ("minecraft:the_end".equals(norm) || "end".equals(norm) || "the_end".equals(norm)) {
+            return "end";
+        }
+        return norm;
+    }
+
     public static String detectDimension(MinecraftClient client) {
         if (client != null && client.world != null) {
             RegistryKey<World> key = client.world.getRegistryKey();
@@ -402,13 +429,7 @@ public class Exporter {
                 return "overworld";
             }
             if (key != null && key.getValue() != null) {
-                String path = key.getValue().getPath().toLowerCase(Locale.ROOT);
-                if (path.contains("nether")) {
-                    return "nether";
-                }
-                if (path.contains("end")) {
-                    return "end";
-                }
+                return detectDimensionFromRegistryId(key.getValue().toString());
             }
         }
         return "overworld";

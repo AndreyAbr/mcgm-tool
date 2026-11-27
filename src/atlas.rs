@@ -92,8 +92,22 @@ pub const VTF_CONVERSION_VERSION: u32 = 4;
 
 /// Computes a deterministic 8-hex-char FNV-1a hash of the sorted texture requests,
 /// world scale, lighting style, and atlas padding for `--reuse-cache`.
+#[cfg(test)]
 pub fn compute_atlas_cache_hash(
     requests: &HashSet<TexRequestKey>,
+    scale: f64,
+    lighting_style: &str,
+    pad: u32,
+) -> String {
+    let empty = AssetIndex::empty();
+    compute_atlas_cache_hash_with_assets(requests, &empty, scale, lighting_style, pad)
+}
+
+/// Computes a deterministic 8-hex-char FNV-1a hash of the sorted texture requests,
+/// resolved PNG/mcmeta asset bytes, world scale, lighting style, and atlas padding.
+pub fn compute_atlas_cache_hash_with_assets(
+    requests: &HashSet<TexRequestKey>,
+    assets: &AssetIndex,
     scale: f64,
     lighting_style: &str,
     pad: u32,
@@ -114,6 +128,7 @@ pub fn compute_atlas_cache_hash(
     mix(lighting_style.as_bytes());
     mix(&[0xff]);
     mix(&pad.to_le_bytes());
+    let mut seen_refs: HashSet<&str> = HashSet::with_capacity(keys.len());
     for k in keys {
         mix(k.tex_ref.as_bytes());
         match k.tint_rgb {
@@ -122,6 +137,26 @@ pub fn compute_atlas_cache_hash(
                 mix(&rgb);
             }
             None => mix(&[0]),
+        }
+        if seen_refs.insert(k.tex_ref.as_str()) {
+            if let Some((png_path, png_bytes, mcmeta_opt)) =
+                assets.resolve_texture_hash_inputs(&k.tex_ref)
+            {
+                mix(&[1]);
+                mix(png_path.as_bytes());
+                mix(&(png_bytes.len() as u64).to_le_bytes());
+                mix(&png_bytes);
+                match mcmeta_opt {
+                    Some(mc) => {
+                        mix(&[1]);
+                        mix(&(mc.len() as u64).to_le_bytes());
+                        mix(&mc);
+                    }
+                    None => mix(&[0]),
+                }
+            } else {
+                mix(&[0]);
+            }
         }
     }
     format!("{:08x}", (h ^ (h >> 32)) as u32)
