@@ -63,6 +63,20 @@ pub struct BlockLight {
     pub dist0: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct ParkourMarker {
+    pub id: String,
+    pub kind: crate::anvil::ParkourMarkerKind,
+    pub name: String,
+    pub mc_pos: [i32; 3],
+    pub is_wall: bool,
+    pub zone_min: [f64; 3],
+    pub zone_max: [f64; 3],
+    pub anchor_pos: [f64; 3],
+    pub forward_dir: [f64; 2],
+    pub yaw: f64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ExtractedFeatures {
     pub doors: Vec<InteractableDoor>,
@@ -2763,6 +2777,114 @@ fn compute_quad_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     [nx / len, ny / len, nz / len]
 }
 
+#[inline]
+fn sign_orientation(bs: &BlockState) -> (bool, f32) {
+    let sname = bs.short_name();
+    let is_wall = sname.contains("wall_sign") || sname.contains("wall_hanging_sign");
+    let yaw_deg: f32 = if is_wall {
+        match bs.prop("facing").unwrap_or("north") {
+            "south" => 0.0,
+            "west" => 90.0,
+            "north" => 180.0,
+            _ => 270.0, // east
+        }
+    } else {
+        let rot: f32 = bs.prop("rotation").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        rot * 22.5
+    };
+    (is_wall, yaw_deg)
+}
+
+#[inline]
+fn rotate_sign_local_xz(px: f64, pz: f64, yaw_deg: f64) -> (f64, f64) {
+    let rad = yaw_deg.to_radians();
+    let (s, c) = rad.sin_cos();
+    let dx = px - 0.5;
+    let dz = pz - 0.5;
+    (dx * c - dz * s + 0.5, dx * s + dz * c + 0.5)
+}
+
+/// Builds parkour activation zones and safe respawn anchors from `[mcgm checkpoint]` /
+/// `[mcgm finish]` front-side signs using the map's MC -> Source coordinate transform.
+pub fn extract_parkour_markers(
+    grid: &VoxelGrid,
+    origin_mc: [f64; 3],
+    scale: f64,
+) -> Vec<ParkourMarker> {
+    let mut keys: Vec<(i32, i32, i32)> = grid.signs.keys().copied().collect();
+    keys.sort();
+
+    let mut markers = Vec::new();
+    for (wx, wy, wz) in keys {
+        let Some(sign) = grid.signs.get(&(wx, wy, wz)) else {
+            continue;
+        };
+        let Some(parsed) = crate::anvil::parse_parkour_sign(sign) else {
+            continue;
+        };
+
+        let bs = grid.get_block(wx, wy, wz);
+        let (is_wall, yaw_deg) = sign_orientation(bs);
+        let yaw_f64 = yaw_deg as f64;
+        let rad = yaw_f64.to_radians();
+        let fx_src = -rad.sin();
+        let fy_src = -rad.cos();
+        let src_yaw = fy_src.atan2(fx_src).to_degrees();
+
+        let (px0, px1, py0, py1, pz0, pz1, anchor_x, anchor_y, anchor_z) = if is_wall {
+            (-0.15, 1.15, -0.85, 1.35, 0.08, 1.45, 0.5, 0.0, 0.75)
+        } else {
+            (-0.25, 1.25, -0.85, 1.35, -0.15, 1.35, 0.5, 0.0, 0.5)
+        };
+
+        let mut zmin = [f64::INFINITY; 3];
+        let mut zmax = [f64::NEG_INFINITY; 3];
+        for px in [px0, px1] {
+            for pz in [pz0, pz1] {
+                let (rx, rz) = rotate_sign_local_xz(px, pz, yaw_f64);
+                for py in [py0, py1] {
+                    let pt = mc_point_to_source(
+                        [wx as f64 + rx, wy as f64 + py, wz as f64 + rz],
+                        origin_mc,
+                        scale,
+                    );
+                    zmin[0] = zmin[0].min(pt[0] as f64);
+                    zmin[1] = zmin[1].min(pt[1] as f64);
+                    zmin[2] = zmin[2].min(pt[2] as f64);
+                    zmax[0] = zmax[0].max(pt[0] as f64);
+                    zmax[1] = zmax[1].max(pt[1] as f64);
+                    zmax[2] = zmax[2].max(pt[2] as f64);
+                }
+            }
+        }
+
+        let (arx, arz) = rotate_sign_local_xz(anchor_x, anchor_z, yaw_f64);
+        let anchor_src = mc_point_to_source(
+            [wx as f64 + arx, wy as f64 + anchor_y, wz as f64 + arz],
+            origin_mc,
+            scale,
+        );
+
+        markers.push(ParkourMarker {
+            id: format!("{}_{}_{}_{}", parsed.kind.as_str(), wx, wy, wz),
+            kind: parsed.kind,
+            name: parsed.name,
+            mc_pos: [wx, wy, wz],
+            is_wall,
+            zone_min: zmin,
+            zone_max: zmax,
+            anchor_pos: [
+                anchor_src[0] as f64,
+                anchor_src[1] as f64,
+                anchor_src[2] as f64,
+            ],
+            forward_dir: [fx_src, fy_src],
+            yaw: src_yaw,
+        });
+    }
+    markers
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_sign_geometry(
     bs: &BlockState,
@@ -2777,23 +2899,9 @@ fn emit_sign_geometry(
     bmin: &mut [f64; 3],
     bmax: &mut [f64; 3],
 ) {
-    let sname = bs.short_name();
-    let is_wall = sname.contains("wall_sign") || sname.contains("wall_hanging_sign");
+    let (is_wall, yaw_deg) = sign_orientation(bs);
     let key_front = format!("{},{},{},front", wx, wy, wz);
     let key_back = format!("{},{},{},back", wx, wy, wz);
-
-    // Angle in radians around +Y_mc
-    let yaw_deg: f32 = if is_wall {
-        match bs.prop("facing").unwrap_or("north") {
-            "south" => 0.0,
-            "west" => 90.0,
-            "north" => 180.0,
-            _ => 270.0, // east
-        }
-    } else {
-        let rot: f32 = bs.prop("rotation").and_then(|v| v.parse().ok()).unwrap_or(0.0);
-        rot * 22.5
-    };
 
     let (y0, y1, z_center) = if is_wall {
         (0.28f32, 0.78f32, 0.04f32)

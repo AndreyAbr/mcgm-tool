@@ -6453,4 +6453,252 @@ mod suite {
         assert!(!tr_text(UiLang::Ru, "status_partial").is_empty());
         assert!(!tr_text(UiLang::En, "partial_title").is_empty());
     }
+
+    #[test]
+    fn test_parkour_sign_recognition_case_whitespace_front_only_and_ordinary_signs() {
+        use crate::anvil::{parse_parkour_sign, ParkourMarkerKind, SignData};
+        use crate::atlas::build_sign_atlas_with_assets;
+
+        let make_sign = |front: [&str; 4], back: [&str; 4]| SignData {
+            x: 10,
+            y: 65,
+            z: 20,
+            front_lines: [
+                front[0].to_string(),
+                front[1].to_string(),
+                front[2].to_string(),
+                front[3].to_string(),
+            ],
+            back_lines: [
+                back[0].to_string(),
+                back[1].to_string(),
+                back[2].to_string(),
+                back[3].to_string(),
+            ],
+            front_color: "black".to_string(),
+            back_color: "black".to_string(),
+        };
+
+        let cp = make_sign(["  [McGm ChEcKpOiNt]  ", "  Башня \"#1\" \\ путь  ", "", ""], ["", "", "", ""]);
+        let parsed_cp = parse_parkour_sign(&cp).expect("checkpoint sign must parse");
+        assert_eq!(parsed_cp.kind, ParkourMarkerKind::Checkpoint);
+        assert_eq!(parsed_cp.name, "Башня \"#1\" \\ путь");
+
+        let cp_empty = make_sign(["[mcgm checkpoint]", "   ", "line3", ""], ["", "", "", ""]);
+        let parsed_empty = parse_parkour_sign(&cp_empty).expect("unnamed checkpoint must parse");
+        assert_eq!(parsed_empty.kind, ParkourMarkerKind::Checkpoint);
+        assert_eq!(parsed_empty.name, "");
+
+        let fin = make_sign(["\t[MCGM FINISH] ", " Финишная \"башня\" ", "", ""], ["", "", "", ""]);
+        let parsed_fin = parse_parkour_sign(&fin).expect("finish sign must parse");
+        assert_eq!(parsed_fin.kind, ParkourMarkerKind::Finish);
+        assert_eq!(parsed_fin.name, "Финишная \"башня\"");
+
+        // Back face or second line must NOT trigger marker recognition
+        let back_only = make_sign(["Обычная табличка", "Строка 2", "", ""], ["[mcgm checkpoint]", "Зад", "", ""]);
+        assert!(parse_parkour_sign(&back_only).is_none());
+        let wrong_line = make_sign(["Старт", "[mcgm checkpoint]", "", ""], ["", "", "", ""]);
+        assert!(parse_parkour_sign(&wrong_line).is_none());
+
+        // Ordinary signs keep rendering normally in sign atlas
+        let mut grid = VoxelGrid {
+            coords: WorldCoords {
+                min_x: 9,
+                min_y: 64,
+                min_z: 19,
+                max_x: 11,
+                max_y: 66,
+                max_z: 21,
+            },
+            palette: vec![
+                BlockState::new("minecraft:air".to_string(), BTreeMap::new()),
+                BlockState::new("minecraft:oak_sign".to_string(), BTreeMap::new()),
+            ],
+            air_id: 0,
+            blocks: vec![0; 27],
+            biome_palette: vec!["minecraft:plains".to_string()],
+            biomes: vec![0; 27],
+            signs: HashMap::new(),
+            player_spawn_mc: None,
+        };
+        let idx = grid.index(10, 65, 20).unwrap();
+        grid.blocks[idx] = 1;
+        grid.signs.insert((10, 65, 20), back_only);
+
+        let assets = AssetIndex::empty();
+        let font = FontRenderer::from_assets(&assets);
+        let sa = build_sign_atlas_with_assets(&grid, &assets, &font);
+        assert!(sa.rects.contains_key("10,65,20,front"));
+        assert!(sa.rects.contains_key("10,65,20,back"));
+    }
+
+    #[test]
+    fn test_parkour_marker_zone_scale_and_wall_sign_front_orientation() {
+        use crate::anvil::{ParkourMarkerKind, SignData};
+        use crate::mesher::{extract_parkour_markers, mc_point_to_source};
+
+        let run_case = |facing: Option<&str>, rot: Option<&str>, is_wall: bool, scale: f64| {
+            let mut props = BTreeMap::new();
+            let block_name = if is_wall {
+                props.insert("facing".to_string(), facing.unwrap().to_string());
+                "minecraft:oak_wall_sign"
+            } else {
+                props.insert("rotation".to_string(), rot.unwrap_or("0").to_string());
+                "minecraft:oak_sign"
+            };
+            let mut grid = VoxelGrid {
+                coords: WorldCoords {
+                    min_x: 0,
+                    min_y: 60,
+                    min_z: 0,
+                    max_x: 4,
+                    max_y: 68,
+                    max_z: 4,
+                },
+                palette: vec![
+                    BlockState::new("minecraft:air".to_string(), BTreeMap::new()),
+                    BlockState::new(block_name.to_string(), props),
+                ],
+                air_id: 0,
+                blocks: vec![0; 5 * 9 * 5],
+                biome_palette: vec!["minecraft:plains".to_string()],
+                biomes: vec![0; 5 * 9 * 5],
+                signs: HashMap::new(),
+                player_spawn_mc: None,
+            };
+            let idx = grid.index(2, 64, 2).unwrap();
+            grid.blocks[idx] = 1;
+            grid.signs.insert(
+                (2, 64, 2),
+                SignData {
+                    x: 2,
+                    y: 64,
+                    z: 2,
+                    front_lines: [
+                        "[mcgm checkpoint]".to_string(),
+                        "Прыжок".to_string(),
+                        String::new(),
+                        String::new(),
+                    ],
+                    back_lines: Default::default(),
+                    front_color: "black".to_string(),
+                    back_color: "black".to_string(),
+                },
+            );
+            let origin_mc = [2.0, 64.0, 2.0];
+            let markers = extract_parkour_markers(&grid, origin_mc, scale);
+            assert_eq!(markers.len(), 1);
+            markers.into_iter().next().unwrap()
+        };
+
+        // Wall sign faces into the corridor (+facing side), never behind the wall it is mounted on
+        // Origin is at (2, 64, 2), so mc=(2..3, 64, 2..3) maps to Source X in [0..scale], Y in [-scale..0]
+        let s_south = run_case(Some("south"), None, true, 39.37);
+        assert_eq!(s_south.kind, ParkourMarkerKind::Checkpoint);
+        assert!(s_south.is_wall);
+        // Facing +Z_mc -> Source -Y: zone spans well into negative Source Y (< -scale)
+        assert!(s_south.zone_min[1] < -1.3 * 39.37);
+        assert!(s_south.anchor_pos[1] < -0.5 * 39.37);
+        assert!(s_south.forward_dir[1] < -0.9);
+
+        let s_north = run_case(Some("north"), None, true, 39.37);
+        // Facing -Z_mc -> Source +Y: zone projects past the block's north face (Y > 0)
+        assert!(s_north.zone_max[1] > 0.3 * 39.37);
+        assert!(s_north.anchor_pos[1] > -0.3 * 39.37);
+        assert!(s_north.forward_dir[1] > 0.9);
+
+        let s_east = run_case(Some("east"), None, true, 39.37);
+        // Facing +X_mc -> Source +X
+        assert!(s_east.zone_max[0] > 1.3 * 39.37);
+        assert!(s_east.anchor_pos[0] > 0.7 * 39.37);
+        assert!(s_east.forward_dir[0] > 0.9);
+
+        let s_west = run_case(Some("west"), None, true, 39.37);
+        // Facing -X_mc -> Source -X
+        assert!(s_west.zone_min[0] < -0.3 * 39.37);
+        assert!(s_west.anchor_pos[0] < 0.3 * 39.37);
+        assert!(s_west.forward_dir[0] < -0.9);
+
+        // Linear scaling check with mc_point_to_source alignment
+        let s_scaled = run_case(Some("east"), None, true, 48.0);
+        let ratio = s_scaled.anchor_pos[0] / s_east.anchor_pos[0];
+        assert!((ratio - (48.0 / 39.37)).abs() < 1e-4);
+
+        let st = run_case(None, Some("4"), false, 39.37);
+        assert!(!st.is_wall);
+        let blk_center = mc_point_to_source([2.5, 64.0, 2.5], [2.0, 64.0, 2.0], 39.37);
+        assert!(st.zone_min[0] < blk_center[0] as f64 && st.zone_max[0] > blk_center[0] as f64);
+    }
+
+    #[test]
+    fn test_parkour_glua_generation_escaping_installation_and_physics_independence() {
+        use crate::anvil::ParkourMarkerKind;
+        use crate::glua::{
+            generate_map_parkour_lua, generate_mcgm_parkour_autorun, install_parkour_marker_files,
+        };
+        use crate::mesher::ParkourMarker;
+
+        let markers = vec![
+            ParkourMarker {
+                id: "checkpoint_10_64_20".to_string(),
+                kind: ParkourMarkerKind::Checkpoint,
+                name: "Башня \"Восток\" \\ 1".to_string(),
+                mc_pos: [10, 64, 20],
+                is_wall: true,
+                zone_min: [100.0, -200.0, -30.0],
+                zone_max: [150.0, -140.0, 50.0],
+                anchor_pos: [125.0, -170.0, 0.0],
+                forward_dir: [1.0, 0.0],
+                yaw: 0.0,
+            },
+            ParkourMarker {
+                id: "finish_30_80_40".to_string(),
+                kind: ParkourMarkerKind::Finish,
+                name: String::new(),
+                mc_pos: [30, 80, 40],
+                is_wall: false,
+                zone_min: [800.0, -400.0, 600.0],
+                zone_max: [860.0, -340.0, 680.0],
+                anchor_pos: [830.0, -370.0, 629.92],
+                forward_dir: [0.0, 1.0],
+                yaw: 90.0,
+            },
+        ];
+
+        let map_lua = generate_map_parkour_lua("gm_parkour_\"test\"", 39.37, &markers);
+        assert!(map_lua.contains("MCGM_PARKOUR.Maps[\"gm_parkour_\\\"test\\\"\"]"));
+        assert!(map_lua.contains("name = \"Башня \\\"Восток\\\" \\\\ 1\""));
+        assert!(map_lua.contains("kind = \"checkpoint\""));
+        assert!(map_lua.contains("kind = \"finish\""));
+
+        // Works independently of MC physics and installs into addon_dir/lua even under --no-import-to-gmod
+        let autorun = generate_mcgm_parkour_autorun();
+        assert!(!autorun.contains("mcgm_physics_enabled"));
+        assert!(!autorun.contains("MCGM_PHYSICS"));
+        assert!(autorun.contains("Контрольная точка: "));
+        assert!(autorun.contains("\"Контрольная точка\""));
+        assert!(autorun.contains("Финиш"));
+        assert!(autorun.contains("util.TraceHull"));
+        assert!(autorun.contains("util.IsInWorld"));
+        assert!(autorun.contains("keeping previous checkpoint"));
+        assert!(autorun.contains("PlayerSpawn"));
+        assert!(autorun.contains("ResetAllPlayerStates"));
+
+        let tmp = make_temp_test_dir("parkour_glua_addon");
+        let addon_dir = tmp.join("addon");
+        let addon_lua = addon_dir.join("lua");
+        install_parkour_marker_files("gm_parkour_test", &[addon_lua.as_path()], 39.37, &markers)
+            .unwrap();
+        assert!(addon_lua.join("autorun/mcgm_parkour.lua").is_file());
+        assert!(addon_lua.join("mcgm_parkour/gm_parkour_test.lua").is_file());
+
+        let out_gma = tmp.join("gm_parkour_test.gma");
+        pack_gma_v3_native(&addon_dir, &out_gma, "MCGM - gm_parkour_test", "{}").unwrap();
+        let gma_bytes = std::fs::read(&out_gma).unwrap();
+        let gma_txt = String::from_utf8_lossy(&gma_bytes);
+        assert!(gma_txt.contains("lua/autorun/mcgm_parkour.lua"));
+        assert!(gma_txt.contains("lua/mcgm_parkour/gm_parkour_test.lua"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

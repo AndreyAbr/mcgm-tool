@@ -33,11 +33,11 @@ use crate::compiler::{
     detect_tools_and_save, load_tool_paths, run_env_check,
     write_addon_metadata, ToolPaths,
 };
-use crate::glua::install_mc_physics_files;
+use crate::glua::{install_mc_physics_files, install_parkour_marker_files};
 use crate::gui::{run_gui_with_config, GuiLaunchConfig, UiLang};
 use crate::mesher::{
-    compute_world_origin_mc, extract_features_and_requests, mc_point_to_source,
-    stream_world_chunks_with_animated,
+    compute_world_origin_mc, extract_features_and_requests, extract_parkour_markers,
+    mc_point_to_source, stream_world_chunks_with_animated,
 };
 use crate::skybox::generate_minecraft_skybox;
 use crate::smd_writer::emit_chunk_smds_and_qcs;
@@ -481,6 +481,7 @@ pub fn run_export_pipeline(
         .map(|bs| assets.resolve_block_model(bs))
         .collect();
     let origin_mc = compute_world_origin_mc(&grid);
+    let parkour_markers = extract_parkour_markers(&grid, origin_mc, eff_scale);
     let (mut features, tex_requests) =
         extract_features_and_requests(&grid, &resolved_models, origin_mc, eff_scale);
     let dt_assets = t1.elapsed().as_secs_f64();
@@ -488,12 +489,13 @@ pub fn run_export_pipeline(
     emit!(
         9,
         &format!(
-            "Resolved {} models ({} textures, {} lights, {} doors, {} buttons) in {:.2}s",
+            "Resolved {} models ({} textures, {} lights, {} doors, {} buttons, {} parkour markers) in {:.2}s",
             resolved_models.len(),
             tex_requests.len(),
             features.lights.len(),
             features.doors.len(),
             features.buttons.len(),
+            parkour_markers.len(),
             dt_assets
         )
     );
@@ -1128,6 +1130,7 @@ pub fn run_export_pipeline(
         opts.mc_physics,
         &col_res.physics_zones,
     )?;
+    install_parkour_marker_files(&opts.map_name, &lua_dests, eff_scale, &parkour_markers)?;
 
     if let Err(e) = write_addon_metadata(&addon_dir, &opts.map_name) {
         eprintln!("[Pipeline] Warning: failed writing addon.json: {}", e);

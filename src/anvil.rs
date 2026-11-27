@@ -142,6 +142,42 @@ pub struct SignData {
     pub back_color: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkourMarkerKind {
+    Checkpoint,
+    Finish,
+}
+
+impl ParkourMarkerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Checkpoint => "checkpoint",
+            Self::Finish => "finish",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedParkourSign {
+    pub kind: ParkourMarkerKind,
+    pub name: String,
+}
+
+/// Parses a Minecraft sign into a parkour marker based strictly on line 1 of its front face
+/// (`[mcgm checkpoint]` or `[mcgm finish]`, case-insensitive, trimmed). Line 2 is an optional name.
+pub fn parse_parkour_sign(sign: &SignData) -> Option<ParsedParkourSign> {
+    let tag = sign.front_lines[0].trim();
+    let kind = if tag.eq_ignore_ascii_case("[mcgm checkpoint]") {
+        ParkourMarkerKind::Checkpoint
+    } else if tag.eq_ignore_ascii_case("[mcgm finish]") {
+        ParkourMarkerKind::Finish
+    } else {
+        return None;
+    };
+    let name = sign.front_lines[1].trim().to_string();
+    Some(ParsedParkourSign { kind, name })
+}
+
 #[derive(Debug, Clone)]
 pub struct VoxelGrid {
     pub coords: WorldCoords,

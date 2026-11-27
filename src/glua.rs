@@ -1,4 +1,5 @@
 use crate::collision::PhysicsZone;
+use crate::mesher::ParkourMarker;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::path::Path;
@@ -21,6 +22,7 @@ fn lua_escape_str(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
             _ => out.push(c),
         }
     }
@@ -84,6 +86,88 @@ pub fn generate_mcgm_physics_autorun() -> String {
 
 pub fn generate_mcgm_smooth_fall_autorun() -> String {
     include_str!("../lua/autorun/mcgm_smooth_fall.lua").to_string()
+}
+
+pub fn generate_mcgm_parkour_autorun() -> String {
+    include_str!("../lua/autorun/mcgm_parkour.lua").to_string()
+}
+
+/// Generates `lua/mcgm_parkour/<map>.lua` containing checkpoint and finish marker zones
+/// in Source coordinates (independent of Minecraft movement physics settings).
+pub fn generate_map_parkour_lua(
+    map_name: &str,
+    scale_factor: f64,
+    markers: &[ParkourMarker],
+) -> String {
+    let map_key = lua_escape_str(&map_name.to_lowercase());
+    let mut out = String::with_capacity(markers.len() * 192 + 320);
+    out.push_str("if not SERVER then return end\n");
+    out.push_str("MCGM_PARKOUR = MCGM_PARKOUR or {}\n");
+    out.push_str("MCGM_PARKOUR.Maps = MCGM_PARKOUR.Maps or {}\n");
+    let _ = writeln!(out, "local mapData = {{\n  scale = {:.2},\n  markers = {{", scale_factor);
+
+    for m in markers {
+        let id_esc = lua_escape_str(&m.id);
+        let name_esc = lua_escape_str(&m.name);
+        let _ = writeln!(
+            out,
+            "    {{ id = \"{}\", kind = \"{}\", name = \"{}\", is_wall = {}, yaw = {:.2}, mc = {{ {}, {}, {} }}, min = {{ {:.2}, {:.2}, {:.2} }}, max = {{ {:.2}, {:.2}, {:.2} }}, anchor = {{ {:.2}, {:.2}, {:.2} }}, fwd = {{ {:.4}, {:.4} }} }},",
+            id_esc,
+            m.kind.as_str(),
+            name_esc,
+            m.is_wall,
+            m.yaw,
+            m.mc_pos[0],
+            m.mc_pos[1],
+            m.mc_pos[2],
+            m.zone_min[0],
+            m.zone_min[1],
+            m.zone_min[2],
+            m.zone_max[0],
+            m.zone_max[1],
+            m.zone_max[2],
+            m.anchor_pos[0],
+            m.anchor_pos[1],
+            m.anchor_pos[2],
+            m.forward_dir[0],
+            m.forward_dir[1],
+        );
+    }
+
+    out.push_str("  }\n}\n");
+    let _ = writeln!(out, "MCGM_PARKOUR.Maps[\"{}\"] = mapData", map_key);
+    let _ = writeln!(
+        out,
+        "if _G.MCGM_RegisterParkourMap then _G.MCGM_RegisterParkourMap(\"{}\", mapData) end",
+        map_key
+    );
+    out
+}
+
+pub fn install_parkour_marker_files(
+    map_name: &str,
+    dest_lua_dirs: &[&Path],
+    scale_factor: f64,
+    markers: &[ParkourMarker],
+) -> Result<(), String> {
+    let autorun_src = generate_mcgm_parkour_autorun();
+    let map_lua_src = generate_map_parkour_lua(map_name, scale_factor, markers);
+    let map_stem = sanitize_map_stem(map_name);
+    let map_fname = format!("{}.lua", map_stem);
+
+    for &lua_dir in dest_lua_dirs {
+        let autorun_dir = lua_dir.join("autorun");
+        let parkour_dir = lua_dir.join("mcgm_parkour");
+        std::fs::create_dir_all(&autorun_dir)
+            .map_err(|e| format!("Failed creating {}: {}", autorun_dir.display(), e))?;
+        std::fs::create_dir_all(&parkour_dir)
+            .map_err(|e| format!("Failed creating {}: {}", parkour_dir.display(), e))?;
+
+        std::fs::write(autorun_dir.join("mcgm_parkour.lua"), &autorun_src)
+            .map_err(|e| e.to_string())?;
+        std::fs::write(parkour_dir.join(&map_fname), &map_lua_src).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub fn generate_map_physics_lua(
