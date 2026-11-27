@@ -155,6 +155,32 @@ impl DebugLogFile {
     }
 }
 
+pub const EXIT_CODE_SUCCESS: i32 = 0;
+pub const EXIT_CODE_FAILED: i32 = 1;
+pub const EXIT_CODE_PARTIAL_SUCCESS: i32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportOutcomeStatus {
+    Success,
+    PartialSuccess,
+}
+
+impl ExportOutcomeStatus {
+    pub fn status_tag(self) -> &'static str {
+        match self {
+            Self::Success => "SUCCESS",
+            Self::PartialSuccess => "PARTIAL_SUCCESS",
+        }
+    }
+
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Success => EXIT_CODE_SUCCESS,
+            Self::PartialSuccess => EXIT_CODE_PARTIAL_SUCCESS,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PipelineSummary {
     pub bsp_path: PathBuf,
@@ -164,6 +190,43 @@ pub struct PipelineSummary {
     pub door_count: usize,
     pub total_secs: f64,
     pub stage_timings: Vec<(String, f64)>,
+}
+
+impl PipelineSummary {
+    pub fn outcome_status(&self) -> ExportOutcomeStatus {
+        if self.gma_error.is_some() {
+            ExportOutcomeStatus::PartialSuccess
+        } else {
+            ExportOutcomeStatus::Success
+        }
+    }
+
+    pub fn status_log_line(&self) -> String {
+        match self.outcome_status() {
+            ExportOutcomeStatus::Success => format!("Status: {}", self.outcome_status().status_tag()),
+            ExportOutcomeStatus::PartialSuccess => format!(
+                "Status: {} (BSP compiled, GMA failed)",
+                self.outcome_status().status_tag()
+            ),
+        }
+    }
+
+    pub fn format_cli_report(&self) -> String {
+        match (&self.outcome_status(), &self.gma_error) {
+            (ExportOutcomeStatus::PartialSuccess, Some(err)) => format!(
+                "Export partially complete (PARTIAL_SUCCESS): BSP ready at {}, but creating new GMA addon failed: {}",
+                self.bsp_path.display(),
+                err
+            ),
+            (ExportOutcomeStatus::PartialSuccess, None) => format!(
+                "Export partially complete (PARTIAL_SUCCESS): BSP ready at {}",
+                self.bsp_path.display()
+            ),
+            (ExportOutcomeStatus::Success, _) => {
+                format!("Export complete: {}", self.bsp_path.display())
+            }
+        }
+    }
 }
 
 fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
@@ -668,6 +731,19 @@ pub fn run_export_pipeline(
         model_guard: Option<compiler::StagedModelGuard>,
         vmt_paths: Vec<PathBuf>,
     }
+    impl StagedGameFilesGuard {
+        fn finish(mut self) -> Result<(), String> {
+            let model_res = match self.model_guard.take() {
+                Some(guard) => guard.finish(),
+                None => Ok(()),
+            };
+            if !self.vmt_paths.is_empty() {
+                compiler::cleanup_staged_files(&self.vmt_paths);
+                self.vmt_paths.clear();
+            }
+            model_res
+        }
+    }
     impl Drop for StagedGameFilesGuard {
         fn drop(&mut self) {
             let _ = self.model_guard.take();
@@ -1011,14 +1087,27 @@ pub fn run_export_pipeline(
             on_progress(bsp_pct, line);
         },
     );
-    drop(staged_guard);
-    let final_bsp = match bsp_res {
-        Ok(p) => p,
-        Err(e) => {
+    let restore_res = staged_guard.finish();
+    let final_bsp = match (bsp_res, restore_res) {
+        (Ok(p), Ok(())) => p,
+        (Err(e), Ok(())) => {
             if let Ok(mut g) = dbg_log.lock() {
                 g.write_line(t_total.elapsed().as_secs_f64(), &format!("Status: FAILED - {}", e));
             }
             return Err(e);
+        }
+        (Ok(_), Err(re)) => {
+            if let Ok(mut g) = dbg_log.lock() {
+                g.write_line(t_total.elapsed().as_secs_f64(), &format!("Status: FAILED - {}", re));
+            }
+            return Err(re);
+        }
+        (Err(e), Err(re)) => {
+            let combined = format!("{}\nAlso failed restoring staged game files: {}", e, re);
+            if let Ok(mut g) = dbg_log.lock() {
+                g.write_line(t_total.elapsed().as_secs_f64(), &format!("Status: FAILED - {}", combined));
+            }
+            return Err(combined);
         }
     };
     let dt_bsp = t7.elapsed().as_secs_f64();
@@ -1098,33 +1187,56 @@ pub fn run_export_pipeline(
         .metadata()
         .map(|m| m.len() as f64 / (1024.0 * 1024.0))
         .unwrap_or(0.0);
+    let summary = PipelineSummary {
+        bsp_path: final_bsp.clone(),
+        gma_path: gma_path.clone(),
+        gma_error: gma_error.clone(),
+        chunk_count,
+        door_count,
+        total_secs,
+        stage_timings: timings.clone(),
+    };
+    let status_line = summary.status_log_line();
     emit!(
         100,
-        &format!(
-            "Done! Map: {} ({:.1} MB) in {:.2}s{}",
-            final_bsp.display(),
-            bsp_mb,
-            total_secs,
-            if gma_error.is_some() {
-                " [GMA FAILED]"
-            } else {
-                ""
-            }
-        )
+        &match gma_error {
+            Some(ref err) => format!(
+                "Done with warnings! Map: {} ({:.1} MB) in {:.2}s [GMA FAILED: {}]",
+                final_bsp.display(),
+                bsp_mb,
+                total_secs,
+                err
+            ),
+            None => format!(
+                "Done! Map: {} ({:.1} MB) in {:.2}s",
+                final_bsp.display(),
+                bsp_mb,
+                total_secs
+            ),
+        }
     );
     if let Ok(mut g) = dbg_log.lock() {
-        g.write_line(total_secs, "Status: SUCCESS");
+        g.write_line(total_secs, &status_line);
+        g.write_line(
+            total_secs,
+            &format!("Playable Map: maps/{}.bsp -> {}", opts.map_name, final_bsp.display()),
+        );
+        if let Some(ref gp) = gma_path {
+            g.write_line(total_secs, &format!("Standalone GMA Addon: {}", gp.display()));
+        } else if let Some(ref err) = gma_error {
+            g.write_line(total_secs, &format!("GMA Error: {}", err));
+        }
         for (stage, secs) in &timings {
             g.write_line(total_secs, &format!("  {:<28} {:>6.3}s", stage, secs));
         }
         g.write_line(total_secs, &format!("  {:<28} {:>6.3}s", "TOTAL", total_secs));
     }
-    println!("Status: SUCCESS");
+    println!("{}", status_line);
     println!("Playable Map: maps/{}.bsp -> {}", opts.map_name, final_bsp.display());
     if let Some(ref gp) = gma_path {
         println!("Standalone GMA Addon: {}", gp.display());
     } else if let Some(ref err) = gma_error {
-        println!("Warning: BSP compiled, but creating new GMA addon failed: {}", err);
+        println!("GMA Error: {}", err);
     }
     println!("=== Stage Timings ===");
     for (stage, secs) in &timings {
@@ -1132,15 +1244,7 @@ pub fn run_export_pipeline(
     }
     println!("  {:<28} {:>6.3}s", "TOTAL", total_secs);
 
-    Ok(PipelineSummary {
-        bsp_path: final_bsp,
-        gma_path,
-        gma_error,
-        chunk_count,
-        door_count,
-        total_secs,
-        stage_timings: timings,
-    })
+    Ok(summary)
 }
 
 fn is_cli_explicit(matches: &clap::ArgMatches, id: &str) -> bool {
@@ -1522,17 +1626,17 @@ fn main() {
 
     match run_export_pipeline(opts, |_, _| {}) {
         Ok(summary) => {
-            println!("Export complete: {}", summary.bsp_path.display());
-            if let Some(ref gma_err) = summary.gma_error {
-                eprintln!(
-                    "Warning: BSP compiled, but creating new GMA addon failed: {}",
-                    gma_err
-                );
+            println!("{}", summary.format_cli_report());
+            if summary.outcome_status() == ExportOutcomeStatus::PartialSuccess {
+                if let Some(ref gma_err) = summary.gma_error {
+                    eprintln!("GMA Error: {}", gma_err);
+                }
+                std::process::exit(summary.outcome_status().exit_code());
             }
         }
         Err(e) => {
             eprintln!("Status: FAILED - {}", e);
-            std::process::exit(1);
+            std::process::exit(EXIT_CODE_FAILED);
         }
     }
 }

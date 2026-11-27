@@ -2043,7 +2043,7 @@ where
 
     let is_nonempty = |p: &Path| p.is_file() && p.metadata().map(|m| m.len() > 0).unwrap_or(false);
     let all_job_rels: Vec<String> = jobs.iter().map(|j| j.mdl_rel.clone()).collect();
-    let _local_guard = if !import_to_gmod {
+    let local_guard = if !import_to_gmod {
         let backup_root = std::env::temp_dir().join("mcgm_staged_backup");
         Some(StagedModelGuard::prepare(
             &tools.game_dir,
@@ -2246,59 +2246,75 @@ where
             .collect()
     });
 
-    let mut trans_ok_flags = vec![false; chunks.len()];
-    let mut extra_col_ok: Vec<Vec<bool>> = chunks
-        .iter()
-        .map(|ch| vec![false; ch.extra_collision_models.len()])
-        .collect();
+    let compile_res: Result<usize, String> = (|| {
+        let mut trans_ok_flags = vec![false; chunks.len()];
+        let mut extra_col_ok: Vec<Vec<bool>> = chunks
+            .iter()
+            .map(|ch| vec![false; ch.extra_collision_models.len()])
+            .collect();
 
-    for res in results {
-        match res? {
-            QcOutcome::Main {
-                chunk_idx,
-                used_fallback,
-            } => {
-                chunks[chunk_idx].fallback_vmf_brushes = used_fallback;
-            }
-            QcOutcome::Translucent { chunk_idx, ok } => {
-                trans_ok_flags[chunk_idx] = ok;
-            }
-            QcOutcome::ExtraCol {
-                chunk_idx,
-                col_idx,
-                ok,
-            } => {
-                if let Some(slot) = extra_col_ok
-                    .get_mut(chunk_idx)
-                    .and_then(|v| v.get_mut(col_idx))
-                {
-                    *slot = ok;
+        for res in results {
+            match res? {
+                QcOutcome::Main {
+                    chunk_idx,
+                    used_fallback,
+                } => {
+                    chunks[chunk_idx].fallback_vmf_brushes = used_fallback;
+                }
+                QcOutcome::Translucent { chunk_idx, ok } => {
+                    trans_ok_flags[chunk_idx] = ok;
+                }
+                QcOutcome::ExtraCol {
+                    chunk_idx,
+                    col_idx,
+                    ok,
+                } => {
+                    if let Some(slot) = extra_col_ok
+                        .get_mut(chunk_idx)
+                        .and_then(|v| v.get_mut(col_idx))
+                    {
+                        *slot = ok;
+                    }
                 }
             }
         }
-    }
 
-    for (chunk_idx, ch) in chunks.iter_mut().enumerate() {
-        if !trans_ok_flags[chunk_idx] {
-            ch.translucent_model_rel_path = None;
-            ch.translucent_qc_path = None;
-        }
-        if !ch.extra_collision_models.is_empty() {
-            let prev_models = std::mem::take(&mut ch.extra_collision_models);
-            let prev_boxes = std::mem::take(&mut ch.extra_collision_boxes);
-            let mut kept_models = Vec::with_capacity(prev_models.len());
-            for (idx, (col_qc, col_mdl)) in prev_models.into_iter().enumerate() {
-                if extra_col_ok[chunk_idx].get(idx).copied().unwrap_or(false) {
-                    kept_models.push((col_qc, col_mdl));
-                } else if let Some(fb) = prev_boxes.get(idx) {
-                    ch.overflow_boxes.extend(fb.iter().cloned());
-                }
+        for (chunk_idx, ch) in chunks.iter_mut().enumerate() {
+            if !trans_ok_flags[chunk_idx] {
+                ch.translucent_model_rel_path = None;
+                ch.translucent_qc_path = None;
             }
-            ch.extra_collision_models = kept_models;
+            if !ch.extra_collision_models.is_empty() {
+                let prev_models = std::mem::take(&mut ch.extra_collision_models);
+                let prev_boxes = std::mem::take(&mut ch.extra_collision_boxes);
+                let mut kept_models = Vec::with_capacity(prev_models.len());
+                for (idx, (col_qc, col_mdl)) in prev_models.into_iter().enumerate() {
+                    if extra_col_ok[chunk_idx].get(idx).copied().unwrap_or(false) {
+                        kept_models.push((col_qc, col_mdl));
+                    } else if let Some(fb) = prev_boxes.get(idx) {
+                        ch.overflow_boxes.extend(fb.iter().cloned());
+                    }
+                }
+                ch.extra_collision_models = kept_models;
+            }
         }
-    }
 
-    Ok(chunks.len())
+        Ok(chunks.len())
+    })();
+
+    let restore_res = match local_guard {
+        Some(guard) => guard.finish(),
+        None => Ok(()),
+    };
+    match (compile_res, restore_res) {
+        (Ok(n), Ok(())) => Ok(n),
+        (Err(e), Ok(())) => Err(e),
+        (Ok(_), Err(re)) => Err(re),
+        (Err(e), Err(re)) => Err(format!(
+            "{}\nAlso failed restoring staged game files: {}",
+            e, re
+        )),
+    }
 }
 
 fn run_studiomdl(studiomdl: &Path, game_dir: &Path, qc_path: &Path) -> (bool, String) {
@@ -2646,10 +2662,11 @@ enum StagedModelEntry {
 }
 
 /// Backs up any pre-existing model sidecars in `game_dir` before staging and
-/// restores them (while removing files created by this run) on `Drop`.
+/// restores them (while removing files created by this run) on `finish()` or `Drop`.
 pub struct StagedModelGuard {
     entries: Vec<StagedModelEntry>,
     backup_dir: Option<PathBuf>,
+    finished: bool,
 }
 
 impl StagedModelGuard {
@@ -2662,6 +2679,7 @@ impl StagedModelGuard {
             return Ok(Self {
                 entries: Vec::new(),
                 backup_dir: None,
+                finished: false,
             });
         }
         let mut seen = HashSet::new();
@@ -2716,36 +2734,116 @@ impl StagedModelGuard {
         Ok(Self {
             entries,
             backup_dir,
+            finished: false,
         })
     }
-}
 
-impl Drop for StagedModelGuard {
-    fn drop(&mut self) {
+    fn restore_all(&mut self) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+
+        let mut failures = Vec::new();
+        let mut kept_backup_files = false;
+
         for entry in &self.entries {
             match entry {
                 StagedModelEntry::Restore {
                     game_path,
                     backup_path,
                 } => {
-                    if backup_path.is_file() {
-                        if let Some(p) = game_path.parent() {
-                            let _ = std::fs::create_dir_all(p);
+                    if !backup_path.is_file() {
+                        failures.push(format!(
+                            "missing backup for {} at {}",
+                            game_path.display(),
+                            backup_path.display()
+                        ));
+                        continue;
+                    }
+                    if let Some(p) = game_path.parent() {
+                        match std::fs::create_dir_all(p) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                kept_backup_files = true;
+                                failures.push(format!(
+                                    "failed creating parent directory for {} ({}); original backup preserved at {}",
+                                    game_path.display(),
+                                    e,
+                                    backup_path.display()
+                                ));
+                                continue;
+                            }
                         }
-                        if std::fs::copy(backup_path, game_path).is_ok() {
-                            let _ = std::fs::remove_file(backup_path);
+                    }
+                    match std::fs::copy(backup_path, game_path) {
+                        Ok(_) => {
+                            if let Err(e) = std::fs::remove_file(backup_path) {
+                                kept_backup_files = true;
+                                eprintln!(
+                                    "[Compiler] Warning: restored {} but failed removing backup {}: {}",
+                                    game_path.display(),
+                                    backup_path.display(),
+                                    e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            kept_backup_files = true;
+                            failures.push(format!(
+                                "failed restoring {} ({}); original backup preserved at {}",
+                                game_path.display(),
+                                e,
+                                backup_path.display()
+                            ));
                         }
                     }
                 }
                 StagedModelEntry::RemoveIfCreated(game_path) => {
                     if game_path.is_file() {
-                        let _ = std::fs::remove_file(game_path);
+                        match std::fs::remove_file(game_path) {
+                            Ok(()) => {}
+                            Err(e) => failures.push(format!(
+                                "failed removing temporary staged file {}: {}",
+                                game_path.display(),
+                                e
+                            )),
+                        }
                     }
                 }
             }
         }
-        if let Some(ref bdir) = self.backup_dir {
-            let _ = std::fs::remove_dir_all(bdir);
+
+        if let (false, Some(ref bdir)) = (kept_backup_files, &self.backup_dir) {
+            let _ = std::fs::remove_dir(bdir);
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            let dir_note = self
+                .backup_dir
+                .as_ref()
+                .filter(|_| kept_backup_files)
+                .map(|d| format!(" (backup dir: {})", d.display()))
+                .unwrap_or_default();
+            Err(format!(
+                "Failed restoring staged game files{}: {}",
+                dir_note,
+                failures.join("; ")
+            ))
+        }
+    }
+
+    pub fn finish(mut self) -> Result<(), String> {
+        self.restore_all()
+    }
+}
+
+impl Drop for StagedModelGuard {
+    fn drop(&mut self) {
+        if let Err(e) = self.restore_all() {
+            eprintln!("[Compiler] Warning: {}", e);
         }
     }
 }

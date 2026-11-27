@@ -713,6 +713,8 @@ pub fn tr_text(lang: UiLang, key: &str) -> &'static str {
         (UiLang::En, "status_cancelled") => "Cancelled",
         (UiLang::Ru, "status_done") => "Готово!",
         (UiLang::En, "status_done") => "Done!",
+        (UiLang::Ru, "status_partial") => "Готово (без GMA)",
+        (UiLang::En, "status_partial") => "Done (GMA failed)",
         (UiLang::Ru, "status_failed") => "Ошибка",
         (UiLang::En, "status_failed") => "Error",
         (UiLang::Ru, "browse_world") => "Выберите папку сохранения мира Minecraft",
@@ -725,6 +727,8 @@ pub fn tr_text(lang: UiLang, key: &str) -> &'static str {
         (UiLang::En, "export_err_title") => "Export error",
         (UiLang::Ru, "done_title") => "Экспорт завершён",
         (UiLang::En, "done_title") => "Export complete",
+        (UiLang::Ru, "partial_title") => "Экспорт завершён частично",
+        (UiLang::En, "partial_title") => "Export partially complete",
         (UiLang::Ru, "confirm_close_title") => "Идёт экспорт",
         (UiLang::En, "confirm_close_title") => "Export in progress",
         (UiLang::Ru, "confirm_close_msg") => "Экспорт ещё выполняется. Прервать и закрыть окно?",
@@ -2697,18 +2701,29 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 pub fn format_done_summary(lang: UiLang, summary: &crate::PipelineSummary) -> String {
-    match lang {
-        UiLang::Ru => {
-            let gma_line = if let Some(ref p) = summary.gma_path {
-                format!("\nGMA-аддон: {}", p.display())
-            } else if let Some(ref err) = summary.gma_error {
-                format!(
-                    "\nПредупреждение: BSP собран, но создать новый GMA не удалось: {}",
-                    err
-                )
-            } else {
-                String::new()
-            };
+    match (lang, &summary.gma_error) {
+        (UiLang::Ru, Some(err)) => format!(
+            "Частичный успех за {:.2}с: BSP готов ({}), но создать GMA не удалось: {}\nЧанки: {}, Двери: {}",
+            summary.total_secs,
+            summary.bsp_path.display(),
+            err,
+            summary.chunk_count,
+            summary.door_count
+        ),
+        (UiLang::En, Some(err)) => format!(
+            "Partial success in {:.2}s: BSP ready ({}), but creating GMA failed: {}\nChunks: {}, Doors: {}",
+            summary.total_secs,
+            summary.bsp_path.display(),
+            err,
+            summary.chunk_count,
+            summary.door_count
+        ),
+        (UiLang::Ru, None) => {
+            let gma_line = summary
+                .gma_path
+                .as_ref()
+                .map(|p| format!("\nGMA-аддон: {}", p.display()))
+                .unwrap_or_default();
             format!(
                 "Готово за {:.2}с! BSP: {}{}\nЧанки: {}, Двери: {}",
                 summary.total_secs,
@@ -2718,17 +2733,12 @@ pub fn format_done_summary(lang: UiLang, summary: &crate::PipelineSummary) -> St
                 summary.door_count
             )
         }
-        UiLang::En => {
-            let gma_line = if let Some(ref p) = summary.gma_path {
-                format!("\nGMA Addon: {}", p.display())
-            } else if let Some(ref err) = summary.gma_error {
-                format!(
-                    "\nWarning: BSP compiled, but failed to create new GMA addon: {}",
-                    err
-                )
-            } else {
-                String::new()
-            };
+        (UiLang::En, None) => {
+            let gma_line = summary
+                .gma_path
+                .as_ref()
+                .map(|p| format!("\nGMA Addon: {}", p.display()))
+                .unwrap_or_default();
             format!(
                 "Done in {:.2}s! BSP: {}{}\nChunks: {}, Doors: {}",
                 summary.total_secs,
@@ -2842,17 +2852,18 @@ fn handle_start_clicked() {
                     })
                 }))
                 .unwrap_or_else(|panic_payload| Err(panic_message(panic_payload)));
-                let msg_res: Result<(String, bool), String> = if cancel_flag_final.load(Ordering::SeqCst) {
-                    Err("__CANCELLED__".to_string())
-                } else {
-                    match outcome {
-                        Ok(summary) => {
-                            let has_warning = summary.gma_error.is_some();
-                            Ok((format_done_summary(lang, &summary), has_warning))
+                let msg_res: Result<(String, crate::ExportOutcomeStatus), String> =
+                    if cancel_flag_final.load(Ordering::SeqCst) {
+                        Err("__CANCELLED__".to_string())
+                    } else {
+                        match outcome {
+                            Ok(summary) => {
+                                let status = summary.outcome_status();
+                                Ok((format_done_summary(lang, &summary), status))
+                            }
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
-                    }
-                };
+                    };
                 let ptr = Box::into_raw(Box::new(msg_res));
                 unsafe {
                     if PostMessageW(target_hwnd, WM_APP_DONE, 0, ptr as isize) == 0 {
@@ -3648,7 +3659,7 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_DONE => {
             KillTimer(hwnd, ID_TIMER_LOG);
             flush_pending_logs();
-            let res_ptr = lparam as *mut Result<(String, bool), String>;
+            let res_ptr = lparam as *mut Result<(String, crate::ExportOutcomeStatus), String>;
             if !res_ptr.is_null() {
                 let res = *Box::from_raw(res_ptr);
                 let (lang, cur_mode) = {
@@ -3657,7 +3668,8 @@ unsafe extern "system" fn wnd_proc(
                     st.busy = false;
                     st.custom_status_text = None;
                     st.status_key = match &res {
-                        Ok(_) => "status_done",
+                        Ok((_, crate::ExportOutcomeStatus::Success)) => "status_done",
+                        Ok((_, crate::ExportOutcomeStatus::PartialSuccess)) => "status_partial",
                         Err(e) if e == "__CANCELLED__" => "status_cancelled",
                         Err(_) => "status_failed",
                     };
@@ -3678,20 +3690,48 @@ unsafe extern "system" fn wnd_proc(
 
                 // Prepare optional modal MessageBox parameters AFTER lock is dropped
                 let modal: Option<(String, String, u32)> = match res {
-                    Ok((msg, has_warning)) => {
+                    Ok((msg, status)) => {
                         if let Some(hp) = get_ctrl_hwnd(ID_PROGRESS) {
                             SendMessageW(hp as HWND, PBM_SETPOS, 100, 0);
                         }
+                        let is_partial = status == crate::ExportOutcomeStatus::PartialSuccess;
                         if let Some(hl) = get_ctrl_hwnd(ID_LBL_STATUS) {
-                            set_ctrl_text(hl, tr_text(lang, "status_done"));
+                            set_ctrl_text(
+                                hl,
+                                tr_text(
+                                    lang,
+                                    if is_partial {
+                                        "status_partial"
+                                    } else {
+                                        "status_done"
+                                    },
+                                ),
+                            );
                         }
                         if let Some(hlog) = get_ctrl_hwnd(ID_LOG) {
                             append_log_line(hlog, &msg);
                         }
+                        if is_partial && !cur_mode.show_log {
+                            set_panel_mode(
+                                hwnd,
+                                GuiLayoutMode {
+                                    show_advanced: cur_mode.show_advanced,
+                                    show_log: true,
+                                },
+                            );
+                        }
                         Some((
-                            tr_text(lang, "done_title").to_string(),
+                            tr_text(
+                                lang,
+                                if is_partial {
+                                    "partial_title"
+                                } else {
+                                    "done_title"
+                                },
+                            )
+                            .to_string(),
                             msg,
-                            if has_warning {
+                            if is_partial {
                                 MB_OK | MB_ICONWARNING
                             } else {
                                 MB_OK | MB_ICONINFORMATION

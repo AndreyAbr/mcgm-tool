@@ -41,6 +41,7 @@ public class Exporter {
     private static final Pattern PAT_NOISY_SEP = Pattern.compile("^[=\\-_*]{4,}$");
     private static final Pattern PAT_PCT_START = Pattern.compile("^\\[\\d{1,3}%\\].*");
     private static final Pattern PAT_PCT_ANY = Pattern.compile(".*\\[\\d{1,3}%\\].*");
+    public static final int EXIT_CODE_PARTIAL_SUCCESS = 2;
     private static String cachedMcgmPath = null;
     private static volatile String lastLaunchError = "";
     private static final AtomicBoolean EXPORT_RUNNING = new AtomicBoolean(false);
@@ -802,6 +803,111 @@ public class Exporter {
         return false;
     }
 
+    public static final class ExportResultTracker {
+        private boolean partialSuccess = false;
+        private String bspPath = "";
+        private String gmaError = "";
+
+        public void acceptLine(String line) {
+            if (line == null) {
+                return;
+            }
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                return;
+            }
+            if (trimmed.startsWith("Status: PARTIAL_SUCCESS")) {
+                partialSuccess = true;
+            }
+            if (trimmed.startsWith("Playable Map:")) {
+                int arrowIdx = trimmed.indexOf("->");
+                if (arrowIdx >= 0) {
+                    bspPath = trimmed.substring(arrowIdx + 2).trim();
+                } else {
+                    bspPath = trimmed.substring("Playable Map:".length()).trim();
+                }
+            }
+            if (trimmed.startsWith("GMA Error:")) {
+                partialSuccess = true;
+                gmaError = trimmed.substring("GMA Error:".length()).trim();
+            } else {
+                String warnPrefix = "Warning: BSP compiled, but creating new GMA addon failed:";
+                if (trimmed.startsWith(warnPrefix)) {
+                    partialSuccess = true;
+                    if (gmaError.isEmpty()) {
+                        gmaError = trimmed.substring(warnPrefix.length()).trim();
+                    }
+                } else {
+                    int gmaFailedIdx = trimmed.indexOf("[GMA FAILED:");
+                    if (gmaFailedIdx >= 0) {
+                        partialSuccess = true;
+                        if (gmaError.isEmpty()) {
+                            int start = gmaFailedIdx + "[GMA FAILED:".length();
+                            int end = trimmed.indexOf(']', start);
+                            gmaError = (end > start ? trimmed.substring(start, end) : trimmed.substring(start)).trim();
+                        }
+                    } else if (trimmed.contains("[GMA FAILED]")) {
+                        partialSuccess = true;
+                    }
+                }
+            }
+        }
+
+        public boolean isPartialSuccess(int exitCode) {
+            return exitCode == EXIT_CODE_PARTIAL_SUCCESS || (exitCode == 0 && partialSuccess);
+        }
+
+        public String getBspPath() {
+            return bspPath;
+        }
+
+        public String getGmaError() {
+            return gmaError;
+        }
+    }
+
+    public static String formatExportCompletionMessage(
+        int exitCode,
+        String mapName,
+        boolean isRussian,
+        int warningCount,
+        int suppressedInfoCount,
+        ExportResultTracker tracker
+    ) {
+        String extra = "";
+        if (warningCount > 0) {
+            extra = isRussian
+                ? "\n§7(Предупреждений: " + warningCount + ", подробный лог: temp/export.log)"
+                : "\n§7(Warnings: " + warningCount + ", full log: temp/export.log)";
+        } else if (suppressedInfoCount > 0) {
+            extra = isRussian
+                ? "\n§7(Подробный лог: temp/export.log)"
+                : "\n§7(Full log: temp/export.log)";
+        }
+
+        if (tracker != null && tracker.isPartialSuccess(exitCode)) {
+            String bspDisplay = (tracker.getBspPath() != null && !tracker.getBspPath().isEmpty())
+                ? tracker.getBspPath()
+                : ("maps/" + mapName + ".bsp");
+            String gmaErrDisplay = (tracker.getGmaError() != null && !tracker.getGmaError().isEmpty())
+                ? tracker.getGmaError()
+                : (isRussian ? "подробности в temp/export.log" : "check temp/export.log for details");
+            return isRussian
+                ? "§e§l[MCGM]§r §6Экспорт завершён частично: BSP готов (§f" + bspDisplay + "§6), но создать GMA не удалось: §c" + gmaErrDisplay + "\n§fЗапуск BSP в консоли GMod: §fmap " + mapName + extra
+                : "§e§l[MCGM]§r §6Export completed partially: BSP ready (§f" + bspDisplay + "§6), but creating GMA failed: §c" + gmaErrDisplay + "\n§fLaunch BSP in GMod console: §fmap " + mapName + extra;
+        }
+
+        if (exitCode == 0) {
+            return isRussian
+                ? "§a§l[MCGM]§r §aЭкспорт успешно завершен! Карта §e\"" + mapName + "\"§a готова к игре в Garry's Mod.\n§fЗапуск в консоли GMod: §fmap " + mapName + extra
+                : "§a§l[MCGM]§r §aExport completed successfully! Map §e\"" + mapName + "\"§a is ready in Garry's Mod.\n§fLaunch in GMod console: §fmap " + mapName + extra;
+        }
+
+        return isRussian
+            ? "§c§l[MCGM]§r §cЭкспорт завершился с ошибкой (код " + exitCode + "). Подробности: temp/export.log"
+            : "§c§l[MCGM]§r §cExport failed with exit code " + exitCode + ". Check temp/export.log for details.";
+    }
+
     private static void streamProcessToChat(
         MinecraftClient client,
         Process process,
@@ -819,6 +925,7 @@ public class Exporter {
             int errorBurst = 0;
             int warningCount = 0;
             int suppressedInfoCount = 0;
+            ExportResultTracker tracker = new ExportResultTracker();
 
             try (
                 BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8));
@@ -834,6 +941,7 @@ public class Exporter {
                     }
 
                     String trimmed = line.trim();
+                    tracker.acceptLine(trimmed);
                     if (isNoisyLogLine(trimmed)) {
                         if (logWriter != null && (now - lastFlushMs) >= 250L) {
                             logWriter.flush();
@@ -844,18 +952,25 @@ public class Exporter {
 
                     String chatMsg = null;
 
+                    boolean isPartialMilestone = trimmed.startsWith("Status: PARTIAL_SUCCESS")
+                        || trimmed.contains("[GMA FAILED");
+
                     boolean isMilestone = PAT_PCT_START.matcher(trimmed).matches()
                         || trimmed.contains("[100%]")
                         || trimmed.startsWith("Status: SUCCESS")
+                        || isPartialMilestone
                         || trimmed.startsWith("Playable Map:")
                         || trimmed.contains("Export completed");
 
-                    boolean isError = trimmed.startsWith("Error:")
-                        || trimmed.startsWith("Error ")
-                        || trimmed.startsWith("[Error]")
-                        || trimmed.startsWith("Traceback")
-                        || trimmed.startsWith("Exception")
-                        || trimmed.contains("FAILED");
+                    boolean isGmaErrorLine = trimmed.startsWith("GMA Error:");
+
+                    boolean isError = !isGmaErrorLine
+                        && (trimmed.startsWith("Error:")
+                            || trimmed.startsWith("Error ")
+                            || trimmed.startsWith("[Error]")
+                            || trimmed.startsWith("Traceback")
+                            || trimmed.startsWith("Exception")
+                            || (trimmed.contains("FAILED") && !isPartialMilestone));
 
                     boolean isWarning = trimmed.startsWith("Warning:")
                         || trimmed.startsWith("WARN:")
@@ -868,7 +983,7 @@ public class Exporter {
                         || trimmed.startsWith("[Compiler]")
                         || trimmed.startsWith("[Hammer]");
 
-                    if (logWriter != null && (isMilestone || isError || (now - lastFlushMs) >= 250L)) {
+                    if (logWriter != null && (isMilestone || isError || isGmaErrorLine || (now - lastFlushMs) >= 250L)) {
                         logWriter.flush();
                         lastFlushMs = now;
                     }
@@ -877,7 +992,10 @@ public class Exporter {
                         errorBurst = 0;
                         if (!trimmed.equals(lastMilestone)) {
                             lastMilestone = trimmed;
-                            if (trimmed.contains("[100%]") || trimmed.startsWith("Status: SUCCESS") || trimmed.contains("Export completed")) {
+                            if (isPartialMilestone) {
+                                warningCount++;
+                                chatMsg = "§e§l[MCGM]§r §6" + trimmed;
+                            } else if (trimmed.contains("[100%]") || trimmed.startsWith("Status: SUCCESS") || trimmed.contains("Export completed")) {
                                 chatMsg = "§a§l[MCGM]§r §a" + trimmed;
                             } else if (PAT_PCT_ANY.matcher(trimmed).matches()) {
                                 chatMsg = "§6§l[MCGM]§r §e" + trimmed;
@@ -885,6 +1003,9 @@ public class Exporter {
                                 chatMsg = "§b[MCGM]§r §f" + trimmed;
                             }
                         }
+                    } else if (isGmaErrorLine) {
+                        warningCount++;
+                        chatMsg = "§c§l[MCGM]§r §c" + trimmed;
                     } else if (isError) {
                         errorBurst++;
                         if (errorBurst <= 4) {
@@ -927,27 +1048,15 @@ public class Exporter {
                 if (client != null) {
                     client.execute(() -> {
                         if (client.player != null) {
-                            if (exitCode == 0) {
-                                String extra = "";
-                                if (finalWarnings > 0) {
-                                    extra = isRussian
-                                        ? "\n§7(Предупреждений: " + finalWarnings + ", подробный лог: temp/export.log)"
-                                        : "\n§7(Warnings: " + finalWarnings + ", full log: temp/export.log)";
-                                } else if (finalSuppressed > 0) {
-                                    extra = isRussian
-                                        ? "\n§7(Подробный лог: temp/export.log)"
-                                        : "\n§7(Full log: temp/export.log)";
-                                }
-                                String msg = isRussian
-                                    ? "§a§l[MCGM]§r §aЭкспорт успешно завершен! Карта §e\"" + mapName + "\"§a готова к игре в Garry's Mod.\n§fЗапуск в консоли GMod: §fmap " + mapName + extra
-                                    : "§a§l[MCGM]§r §aExport completed successfully! Map §e\"" + mapName + "\"§a is ready in Garry's Mod.\n§fLaunch in GMod console: §fmap " + mapName + extra;
-                                client.player.sendMessage(Text.literal(msg), false);
-                            } else {
-                                String msg = isRussian
-                                    ? "§c§l[MCGM]§r §cЭкспорт завершился с ошибкой (код " + exitCode + "). Подробности: temp/export.log"
-                                    : "§c§l[MCGM]§r §cExport failed with exit code " + exitCode + ". Check temp/export.log for details.";
-                                client.player.sendMessage(Text.literal(msg), false);
-                            }
+                            String msg = formatExportCompletionMessage(
+                                exitCode,
+                                mapName,
+                                isRussian,
+                                finalWarnings,
+                                finalSuppressed,
+                                tracker
+                            );
+                            client.player.sendMessage(Text.literal(msg), false);
                         }
                     });
                 }

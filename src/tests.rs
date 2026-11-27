@@ -6311,4 +6311,149 @@ mod suite {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn test_staged_model_guard_preserves_backup_and_restores_others_on_partial_failure() {
+        use crate::compiler::StagedModelGuard;
+
+        let tmp = make_temp_test_dir("staged_guard_partial_fail");
+        let game_dir = tmp.join("game");
+        let backup_root = tmp.join("backups");
+        let model_dir = game_dir.join("models/custom_mc/gm_map");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::create_dir_all(&backup_root).unwrap();
+
+        let mdl_path = model_dir.join("chunk_0_0.mdl");
+        let vvd_path = model_dir.join("chunk_0_0.vvd");
+        let phy_path = model_dir.join("chunk_0_0.phy");
+        let new_tmp_mdl = model_dir.join("chunk_1_0.mdl");
+
+        let orig_mdl = b"ORIGINAL_MDL_CONTENTS_KEEP_BACKUP";
+        let orig_vvd = b"ORIGINAL_VVD_CONTENTS";
+        let orig_phy = b"ORIGINAL_PHY_CONTENTS";
+        std::fs::write(&mdl_path, orig_mdl).unwrap();
+        std::fs::write(&vvd_path, orig_vvd).unwrap();
+        std::fs::write(&phy_path, orig_phy).unwrap();
+
+        let rels = vec![
+            "models/custom_mc/gm_map/chunk_0_0.mdl".to_string(),
+            "models/custom_mc/gm_map/chunk_1_0.mdl".to_string(),
+        ];
+
+        // 1. Explicit finish() path: place a directory where chunk_0_0.mdl should be restored
+        let guard = StagedModelGuard::prepare(&game_dir, &rels, &backup_root).unwrap();
+        std::fs::write(&vvd_path, b"CORRUPTED_VVD").unwrap();
+        std::fs::write(&phy_path, b"CORRUPTED_PHY").unwrap();
+        std::fs::write(&new_tmp_mdl, b"TEMP_MODEL").unwrap();
+        std::fs::remove_file(&mdl_path).unwrap();
+        std::fs::create_dir_all(&mdl_path).unwrap();
+
+        let err = guard
+            .finish()
+            .expect_err("restoring into a directory path must return Err");
+        assert!(
+            err.contains("chunk_0_0.mdl"),
+            "error must name failed target path: {}",
+            err
+        );
+        assert_eq!(std::fs::read(&vvd_path).unwrap(), orig_vvd);
+        assert_eq!(std::fs::read(&phy_path).unwrap(), orig_phy);
+        assert!(!new_tmp_mdl.exists(), "temporary file must be removed even on partial failure");
+
+        let preserved_baks: Vec<std::path::PathBuf> = std::fs::read_dir(&backup_root)
+            .unwrap()
+            .flatten()
+            .flat_map(|d| std::fs::read_dir(d.path()).ok().into_iter().flatten().flatten())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("bak"))
+            .collect();
+        assert_eq!(
+            preserved_baks.len(),
+            1,
+            "only the un-restorable backup should remain, found: {:?}",
+            preserved_baks
+        );
+        let preserved_path_str = preserved_baks[0].to_string_lossy().into_owned();
+        assert!(
+            err.contains(&preserved_path_str),
+            "error must expose preserved backup path '{}': {}",
+            preserved_path_str,
+            err
+        );
+        assert_eq!(
+            std::fs::read(&preserved_baks[0]).unwrap(),
+            orig_mdl,
+            "preserved backup must contain exact original bytes"
+        );
+
+        // Clean up collision and verify Drop fallback also preserves backups on partial failure
+        std::fs::remove_dir_all(&mdl_path).unwrap();
+        std::fs::write(&mdl_path, orig_mdl).unwrap();
+        let drop_backup_root = tmp.join("drop_backups");
+        std::fs::create_dir_all(&drop_backup_root).unwrap();
+        {
+            let _drop_guard = StagedModelGuard::prepare(&game_dir, &rels, &drop_backup_root).unwrap();
+            std::fs::write(&vvd_path, b"DROP_CORRUPT_VVD").unwrap();
+            std::fs::remove_file(&mdl_path).unwrap();
+            std::fs::create_dir_all(&mdl_path).unwrap();
+        }
+        assert_eq!(std::fs::read(&vvd_path).unwrap(), orig_vvd);
+        let drop_baks: Vec<std::path::PathBuf> = std::fs::read_dir(&drop_backup_root)
+            .unwrap()
+            .flatten()
+            .flat_map(|d| std::fs::read_dir(d.path()).ok().into_iter().flatten().flatten())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("bak"))
+            .collect();
+        assert_eq!(drop_baks.len(), 1);
+        assert_eq!(std::fs::read(&drop_baks[0]).unwrap(), orig_mdl);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_partial_success_bsp_ready_gma_failed_contract_cli_log_and_gui() {
+        let ok_summary = crate::PipelineSummary {
+            bsp_path: std::path::PathBuf::from(r"C:\exports\gm_demo.bsp"),
+            gma_path: Some(std::path::PathBuf::from(r"C:\exports\gm_demo.gma")),
+            gma_error: None,
+            chunk_count: 5,
+            door_count: 2,
+            total_secs: 3.25,
+            stage_timings: vec![],
+        };
+        assert_eq!(ok_summary.outcome_status(), crate::ExportOutcomeStatus::Success);
+        assert_eq!(ok_summary.outcome_status().exit_code(), crate::EXIT_CODE_SUCCESS);
+        assert_eq!(ok_summary.status_log_line(), "Status: SUCCESS");
+
+        let partial = crate::PipelineSummary {
+            bsp_path: std::path::PathBuf::from(r"C:\exports\gm_demo.bsp"),
+            gma_path: None,
+            gma_error: Some("disk full".to_string()),
+            chunk_count: 5,
+            door_count: 2,
+            total_secs: 3.25,
+            stage_timings: vec![],
+        };
+        assert_eq!(partial.outcome_status(), crate::ExportOutcomeStatus::PartialSuccess);
+        assert_eq!(
+            partial.outcome_status().exit_code(),
+            crate::EXIT_CODE_PARTIAL_SUCCESS
+        );
+        let status_line = partial.status_log_line();
+        assert!(status_line.starts_with("Status: PARTIAL_SUCCESS"));
+        assert!(!status_line.contains("Status: SUCCESS"));
+
+        let cli_report = partial.format_cli_report();
+        assert!(cli_report.contains("PARTIAL_SUCCESS"));
+        assert!(cli_report.contains("gm_demo.bsp"));
+        assert!(cli_report.contains("disk full"));
+
+        let gui_ru = format_done_summary(UiLang::Ru, &partial);
+        let gui_en = format_done_summary(UiLang::En, &partial);
+        assert!(gui_ru.contains("Частичный успех") && gui_ru.contains("gm_demo.bsp") && gui_ru.contains("disk full"));
+        assert!(gui_en.contains("Partial success") && gui_en.contains("gm_demo.bsp") && gui_en.contains("disk full"));
+        assert!(!tr_text(UiLang::Ru, "status_partial").is_empty());
+        assert!(!tr_text(UiLang::En, "partial_title").is_empty());
+    }
 }
