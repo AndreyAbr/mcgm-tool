@@ -6198,14 +6198,11 @@ mod suite {
             zw.finish().unwrap();
         };
 
-        let calls_log = tmp.join("vtf_calls.txt");
+        let vtf_stage_dir = work_dir.join("vtf_stage");
         let mock_vtfcmd = tmp.join("mock_vtfcmd.cmd");
         std::fs::write(
             &mock_vtfcmd,
-            format!(
-                "@echo off\r\necho %~n2>>\"{}\"\r\ncopy /y \"%~2\" \"%~4\\%~n2.vtf\" >nul\r\n",
-                calls_log.display()
-            ),
+            "@echo off\r\necho called>\"%~4\\%~n2.called\"\r\ncopy /y \"%~2\" \"%~4\\%~n2.vtf\" >nul\r\n",
         )
         .unwrap();
 
@@ -6240,18 +6237,19 @@ mod suite {
         crate::atlas::save_png_fast(&atlas1.image, &atlas_png_1).unwrap();
         crate::atlas::save_png_fast(&ImageBuffer::new(16, 16), &sign_png).unwrap();
         compile_materials(&tools, "custom_mc", &atlas_png_1, &sign_png, &HashMap::new(), &[], &addon_dir, false, true).unwrap();
+        let called_h1 = vtf_stage_dir.join(format!("atlas_{}.called", h1));
+        assert!(called_h1.is_file(), "initial atlas must invoke VTFCmd");
 
         // 2. Identical JAR -> same hash & VTF cache hit (VTFCmd skipped for atlas)
-        let _ = std::fs::remove_file(&calls_log);
+        let _ = std::fs::remove_file(&called_h1);
         let assets1_rep = AssetIndex::discover_and_load(Some(&jar_path), None, &[]);
         let h1_rep = compute_atlas_cache_hash_with_assets(&reqs, &assets1_rep, 39.37, "minecraft", 8);
         assert_eq!(h1_rep, h1);
         compile_materials(&tools, "custom_mc", &atlas_png_1, &sign_png, &HashMap::new(), &[], &addon_dir, false, true).unwrap();
-        let rep_log = std::fs::read_to_string(&calls_log).unwrap_or_default();
-        assert!(!rep_log.contains(&format!("atlas_{}", h1)), "identical assets must reuse cached VTF");
+        assert!(!called_h1.exists(), "identical assets must reuse cached VTF");
 
         // 3. Replace stone.png bytes in JAR under same name with blue pixels -> new hash, new atlas, new VTF
-        let _ = std::fs::remove_file(&calls_log);
+        let _ = std::fs::remove_file(&called_h1);
         write_jar([10, 30, 240, 255]);
         let assets2 = AssetIndex::discover_and_load(Some(&jar_path), None, &[]);
         let h2 = compute_atlas_cache_hash_with_assets(&reqs, &assets2, 39.37, "minecraft", 8);
@@ -6262,15 +6260,14 @@ mod suite {
         let atlas_png_2 = work_dir.join(format!("atlas_{}.png", h2));
         crate::atlas::save_png_fast(&atlas2.image, &atlas_png_2).unwrap();
         compile_materials(&tools, "custom_mc", &atlas_png_2, &sign_png, &HashMap::new(), &[], &addon_dir, false, true).unwrap();
-        let log2 = std::fs::read_to_string(&calls_log).unwrap_or_default();
-        assert!(log2.contains(&format!("atlas_{}", h2)), "changed PNG must invoke VTFCmd for new atlas");
+        let called_h2 = vtf_stage_dir.join(format!("atlas_{}.called", h2));
+        assert!(called_h2.is_file(), "changed PNG must invoke VTFCmd for new atlas");
 
         // 4. Even if PNG path has the same filename, changing its bytes invalidates .vtf.src_hash
-        let _ = std::fs::remove_file(&calls_log);
+        let _ = std::fs::remove_file(&called_h1);
         crate::atlas::save_png_fast(&atlas2.image, &atlas_png_1).unwrap();
         compile_materials(&tools, "custom_mc", &atlas_png_1, &sign_png, &HashMap::new(), &[], &addon_dir, false, true).unwrap();
-        let log3 = std::fs::read_to_string(&calls_log).unwrap_or_default();
-        assert!(log3.contains(&format!("atlas_{}", h1)), "vtf.src_hash mismatch must re-run VTFCmd");
+        assert!(called_h1.is_file(), "vtf.src_hash mismatch must re-run VTFCmd");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
