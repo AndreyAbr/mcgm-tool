@@ -139,14 +139,12 @@ pub fn compute_atlas_cache_hash_with_assets(
             None => mix(&[0]),
         }
         if seen_refs.insert(k.tex_ref.as_str()) {
-            if let Some((png_path, png_bytes, mcmeta_opt)) =
-                assets.resolve_texture_hash_inputs(&k.tex_ref)
-            {
+            if let Some(inputs) = assets.resolve_texture_hash_inputs(&k.tex_ref) {
                 mix(&[1]);
-                mix(png_path.as_bytes());
-                mix(&(png_bytes.len() as u64).to_le_bytes());
-                mix(&png_bytes);
-                match mcmeta_opt {
+                mix(inputs.path.as_bytes());
+                mix(&(inputs.png_bytes.len() as u64).to_le_bytes());
+                mix(&inputs.png_bytes);
+                match inputs.mcmeta_bytes {
                     Some(mc) => {
                         mix(&[1]);
                         mix(&(mc.len() as u64).to_le_bytes());

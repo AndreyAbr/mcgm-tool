@@ -205,6 +205,12 @@ enum AssetLoc {
     File(PathBuf),
 }
 
+pub struct TextureHashInputs {
+    pub path: String,
+    pub png_bytes: Arc<[u8]>,
+    pub mcmeta_bytes: Option<Arc<[u8]>>,
+}
+
 pub struct AssetIndex {
     zip_sources: Vec<Mutex<ZipArchive<BufReader<File>>>>,
     entries: HashMap<String, AssetLoc>, // normalized lowercase paths "assets/<ns>/..."
@@ -548,14 +554,15 @@ impl AssetIndex {
         None
     }
 
-    pub fn resolve_texture_hash_inputs(
-        &self,
-        tex_ref: &str,
-    ) -> Option<(String, Arc<[u8]>, Option<Arc<[u8]>>)> {
-        let (png_path, bytes) = self.resolve_texture_bytes(tex_ref)?;
-        let mcmeta_path = format!("{}.mcmeta", png_path);
-        let mcmeta = self.get_bytes(&mcmeta_path);
-        Some((png_path, bytes, mcmeta))
+    pub fn resolve_texture_hash_inputs(&self, tex_ref: &str) -> Option<TextureHashInputs> {
+        let (path, png_bytes) = self.resolve_texture_bytes(tex_ref)?;
+        let mcmeta_path = format!("{}.mcmeta", path);
+        let mcmeta_bytes = self.get_bytes(&mcmeta_path);
+        Some(TextureHashInputs {
+            path,
+            png_bytes,
+            mcmeta_bytes,
+        })
     }
 
     pub fn load_animated_texture_frames(&self, tex_ref: &str) -> Option<AnimatedStrip> {
