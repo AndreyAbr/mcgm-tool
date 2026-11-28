@@ -361,6 +361,7 @@ pub struct GuiLaunchConfig {
     pub max_convex: Option<usize>,
     pub reuse_cache: Option<bool>,
     pub debug_log: Option<PathBuf>,
+    pub mod_snapshot: Option<PathBuf>,
     pub startup_error: Option<String>,
     pub auto_start: bool,
     pub lang: Option<UiLang>,
@@ -925,6 +926,7 @@ struct GuiState {
     cli_max_convex: Option<usize>,
     cli_reuse_cache: Option<bool>,
     cli_debug_log: Option<PathBuf>,
+    cli_mod_snapshot: Option<PathBuf>,
     custom_dimension: Option<String>,
 }
 
@@ -2502,6 +2504,9 @@ pub(crate) fn resolve_gui_pipeline_options(
         cfg.debug_log.clone(),
         derived_preset,
     );
+    if let Some(ref ms) = cfg.mod_snapshot {
+        opts.mod_snapshot = Some(ms.clone());
+    }
     opts
 }
 
@@ -2634,7 +2639,7 @@ fn validate_and_build_options(lang: UiLang, config_path: Option<PathBuf>) -> Res
     let light_idx = get_ctrl_hwnd(ID_COMBO_LIGHT)
         .map(|h| unsafe { SendMessageW(h as HWND, CB_GETCURSEL, 0, 0) })
         .unwrap_or(0);
-    let (build_preset, custom_dim, cli_cs, cli_mw, cli_mc, cli_rc, cli_dl) = GUI_STATE
+    let (build_preset, custom_dim, cli_cs, cli_mw, cli_mc, cli_rc, cli_dl, cli_ms) = GUI_STATE
         .get()
         .and_then(|l| l.lock().ok())
         .map(|st| {
@@ -2646,9 +2651,10 @@ fn validate_and_build_options(lang: UiLang, config_path: Option<PathBuf>) -> Res
                 st.cli_max_convex,
                 st.cli_reuse_cache,
                 st.cli_debug_log.clone(),
+                st.cli_mod_snapshot.clone(),
             )
         })
-        .unwrap_or_else(|| ("balanced".to_string(), None, None, None, None, None, None));
+        .unwrap_or_else(|| ("balanced".to_string(), None, None, None, None, None, None, None));
 
     let mut opts = PipelineOptions {
         world_dir: PathBuf::from(&world_s),
@@ -2675,6 +2681,7 @@ fn validate_and_build_options(lang: UiLang, config_path: Option<PathBuf>) -> Res
         mc_physics: get_chk(ID_CHK_MC_PHYSICS),
         force_vmf_brushes: get_chk(ID_CHK_VMF_BRUSHES),
         scale,
+        mod_snapshot: cli_ms,
         ..Default::default()
     };
     apply_cli_overrides_to_pipeline_options(
@@ -2701,22 +2708,38 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 pub fn format_done_summary(lang: UiLang, summary: &crate::PipelineSummary) -> String {
+    let snap_line = summary
+        .mod_snapshot_report
+        .as_ref()
+        .map(|rep| match lang {
+            UiLang::Ru => format!(
+                "\nСнимок модов: покрыто {} (full: {}, partial: {}), fallback: {}",
+                rep.covered_blocks, rep.full_blocks, rep.partial_blocks, rep.fallback_blocks
+            ),
+            UiLang::En => format!(
+                "\nMod snapshot: {} covered ({} full, {} partial), {} fallback",
+                rep.covered_blocks, rep.full_blocks, rep.partial_blocks, rep.fallback_blocks
+            ),
+        })
+        .unwrap_or_default();
     match (lang, &summary.gma_error) {
         (UiLang::Ru, Some(err)) => format!(
-            "Частичный успех за {:.2}с: BSP готов ({}), но создать GMA не удалось: {}\nЧанки: {}, Двери: {}",
+            "Частичный успех за {:.2}с: BSP готов ({}), но создать GMA не удалось: {}\nЧанки: {}, Двери: {}{}",
             summary.total_secs,
             summary.bsp_path.display(),
             err,
             summary.chunk_count,
-            summary.door_count
+            summary.door_count,
+            snap_line
         ),
         (UiLang::En, Some(err)) => format!(
-            "Partial success in {:.2}s: BSP ready ({}), but creating GMA failed: {}\nChunks: {}, Doors: {}",
+            "Partial success in {:.2}s: BSP ready ({}), but creating GMA failed: {}\nChunks: {}, Doors: {}{}",
             summary.total_secs,
             summary.bsp_path.display(),
             err,
             summary.chunk_count,
-            summary.door_count
+            summary.door_count,
+            snap_line
         ),
         (UiLang::Ru, None) => {
             let gma_line = summary
@@ -2725,12 +2748,13 @@ pub fn format_done_summary(lang: UiLang, summary: &crate::PipelineSummary) -> St
                 .map(|p| format!("\nGMA-аддон: {}", p.display()))
                 .unwrap_or_default();
             format!(
-                "Готово за {:.2}с! BSP: {}{}\nЧанки: {}, Двери: {}",
+                "Готово за {:.2}с! BSP: {}{}\nЧанки: {}, Двери: {}{}",
                 summary.total_secs,
                 summary.bsp_path.display(),
                 gma_line,
                 summary.chunk_count,
-                summary.door_count
+                summary.door_count,
+                snap_line
             )
         }
         (UiLang::En, None) => {
@@ -2740,12 +2764,13 @@ pub fn format_done_summary(lang: UiLang, summary: &crate::PipelineSummary) -> St
                 .map(|p| format!("\nGMA Addon: {}", p.display()))
                 .unwrap_or_default();
             format!(
-                "Done in {:.2}s! BSP: {}{}\nChunks: {}, Doors: {}",
+                "Done in {:.2}s! BSP: {}{}\nChunks: {}, Doors: {}{}",
                 summary.total_secs,
                 summary.bsp_path.display(),
                 gma_line,
                 summary.chunk_count,
-                summary.door_count
+                summary.door_count,
+                snap_line
             )
         }
     }
@@ -4167,6 +4192,7 @@ pub fn run_gui_with_config(cfg: GuiLaunchConfig) -> Result<(), String> {
             cli_max_convex: cfg.max_convex,
             cli_reuse_cache: cfg.reuse_cache,
             cli_debug_log: cfg.debug_log.clone(),
+            cli_mod_snapshot: cfg.mod_snapshot.clone(),
             custom_dimension: None,
         }));
 

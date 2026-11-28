@@ -10,6 +10,7 @@ import net.minecraft.registry.RegistryKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.text.Text;
 import net.minecraft.util.WorldSavePath;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.World;
 
 import java.io.BufferedReader;
@@ -55,6 +56,7 @@ public class Exporter {
         public boolean hqLight = false;
         public boolean importGMod = true;
         public boolean exportVmf = false;
+        public boolean captureModSnapshot = false;
         public String dimensionMode = "auto";
         public String worldOverride = "";
     }
@@ -226,6 +228,7 @@ public class Exporter {
         s.hqLight = getJsonBoolean(obj, "hq_light", false);
         s.importGMod = getJsonBoolean(obj, "import_gmod", true);
         s.exportVmf = getJsonBoolean(obj, "export_vmf", false);
+        s.captureModSnapshot = getJsonBoolean(obj, "capture_mod_snapshot", false);
         s.dimensionMode = sanitizeDimensionMode(getJsonString(obj, "dimension", s.dimensionMode));
         s.worldOverride = getJsonString(obj, "world_override", "").trim();
         return s;
@@ -242,6 +245,7 @@ public class Exporter {
         obj.addProperty("hq_light", s.hqLight);
         obj.addProperty("import_gmod", s.importGMod);
         obj.addProperty("export_vmf", s.exportVmf);
+        obj.addProperty("capture_mod_snapshot", s.captureModSnapshot);
         obj.addProperty("dimension", sanitizeDimensionMode(s.dimensionMode));
         obj.addProperty("world_override", s.worldOverride != null ? s.worldOverride.trim() : "");
         writeConfigJson(client, obj);
@@ -599,6 +603,7 @@ public class Exporter {
             saved.hqLight,
             importGMod,
             exportVmf,
+            saved.captureModSnapshot,
             saved.dimensionMode,
             saved.worldOverride,
             customMcgmPath,
@@ -617,6 +622,43 @@ public class Exporter {
         boolean hqLight,
         boolean importGMod,
         boolean exportVmf,
+        String dimensionMode,
+        String worldOverride,
+        String customMcgmPath,
+        String explicitLang
+    ) {
+        ScreenSettings saved = loadScreenSettings(client);
+        return launchExport(
+            client,
+            minX, minY, minZ,
+            maxX, maxY, maxZ,
+            mapName,
+            category,
+            lightingStyle,
+            mcPhysics,
+            hqLight,
+            importGMod,
+            exportVmf,
+            saved.captureModSnapshot,
+            dimensionMode,
+            worldOverride,
+            customMcgmPath,
+            explicitLang
+        );
+    }
+
+    public static boolean launchExport(
+        MinecraftClient client,
+        int minX, int minY, int minZ,
+        int maxX, int maxY, int maxZ,
+        String mapName,
+        String category,
+        String lightingStyle,
+        boolean mcPhysics,
+        boolean hqLight,
+        boolean importGMod,
+        boolean exportVmf,
+        boolean captureModSnapshot,
         String dimensionMode,
         String worldOverride,
         String customMcgmPath,
@@ -720,6 +762,22 @@ public class Exporter {
 
         if (exportVmf) {
             cmd.add("--export-vmf");
+        }
+
+        if (captureModSnapshot) {
+            boolean isRu = "ru".equals(lang);
+            Path snapDir = workspaceDir.toPath()
+                .resolve("temp")
+                .resolve("mod_snapshots")
+                .resolve(cleanMap);
+            ModBlockSnapshotter.SnapshotResult snap = tryCaptureSnapshotForLaunch(
+                client, minX, minY, minZ, maxX, maxY, maxZ,
+                resolvedDimension, new File(worldPath).getName(), snapDir, isRu
+            );
+            if (snap != null) {
+                cmd.add("--mod-snapshot");
+                cmd.add(snap.snapshotDir.toAbsolutePath().toString());
+            }
         }
 
         if (!EXPORT_RUNNING.compareAndSet(false, true)) {
@@ -1120,6 +1178,7 @@ public class Exporter {
             saved.lightingStyle,
             saved.mcPhysics,
             saved.hqLight,
+            saved.captureModSnapshot,
             saved.dimensionMode,
             saved.worldOverride,
             customMcgmPath,
@@ -1136,6 +1195,39 @@ public class Exporter {
         String lightingStyle,
         boolean mcPhysics,
         boolean hqLight,
+        String dimensionMode,
+        String worldOverride,
+        String customMcgmPath,
+        String explicitLang
+    ) {
+        ScreenSettings saved = loadScreenSettings(client);
+        return launchGui(
+            client,
+            minX, minY, minZ,
+            maxX, maxY, maxZ,
+            mapName,
+            category,
+            lightingStyle,
+            mcPhysics,
+            hqLight,
+            saved.captureModSnapshot,
+            dimensionMode,
+            worldOverride,
+            customMcgmPath,
+            explicitLang
+        );
+    }
+
+    public static boolean launchGui(
+        MinecraftClient client,
+        int minX, int minY, int minZ,
+        int maxX, int maxY, int maxZ,
+        String mapName,
+        String category,
+        String lightingStyle,
+        boolean mcPhysics,
+        boolean hqLight,
+        boolean captureModSnapshot,
         String dimensionMode,
         String worldOverride,
         String customMcgmPath,
@@ -1233,6 +1325,25 @@ public class Exporter {
             cmd.add("--hq-light");
         }
 
+        if (captureModSnapshot && client != null && client.world != null) {
+            boolean isRu = "ru".equals(lang);
+            String wName = (worldPath != null && !worldPath.isEmpty())
+                ? new File(worldPath).getName()
+                : "client_world";
+            Path snapDir = workspaceDir.toPath()
+                .resolve("temp")
+                .resolve("mod_snapshots")
+                .resolve(cleanMap);
+            ModBlockSnapshotter.SnapshotResult snap = tryCaptureSnapshotForLaunch(
+                client, minX, minY, minZ, maxX, maxY, maxZ,
+                resolvedDimension, wName, snapDir, isRu
+            );
+            if (snap != null) {
+                cmd.add("--mod-snapshot");
+                cmd.add(snap.snapshotDir.toAbsolutePath().toString());
+            }
+        }
+
         try {
             File tempDir = new File(workspaceDir, "temp");
             if (!tempDir.exists()) {
@@ -1261,6 +1372,86 @@ public class Exporter {
             setLastLaunchError(shortErr);
             sendChat(client, "§c[MCGM] " + shortErr);
             return false;
+        }
+    }
+
+    public static ModBlockSnapshotter.SnapshotResult captureSnapshotStandalone(
+        MinecraftClient client,
+        int minX, int minY, int minZ,
+        int maxX, int maxY, int maxZ,
+        String dimensionMode,
+        String worldOverride,
+        String explicitLang
+    ) {
+        String lang = resolveLang(client, explicitLang);
+        boolean isRu = "ru".equals(lang);
+        String resolvedDimension = resolveDimension(client, dimensionMode);
+        String worldPath = resolveWorldForLaunch(client, worldOverride, lang, false);
+        Path baseDir;
+        String worldName;
+        if (worldPath != null && !worldPath.isEmpty() && new File(worldPath).isDirectory()) {
+            baseDir = new File(worldPath).toPath().resolve("mcgm_snapshots");
+            worldName = new File(worldPath).getName();
+        } else {
+            File runDir = (client != null && client.runDirectory != null) ? client.runDirectory : new File(".");
+            baseDir = runDir.toPath().resolve("mcgm_snapshots");
+            worldName = "client_world";
+        }
+        String folderName = "snapshot_" + (System.currentTimeMillis() / 1000L);
+        Path snapDir = baseDir.resolve(folderName);
+        return tryCaptureSnapshotForLaunch(
+            client, minX, minY, minZ, maxX, maxY, maxZ,
+            resolvedDimension, worldName, snapDir, isRu
+        );
+    }
+
+    private static void deleteDirQuietly(Path dir) {
+        if (dir == null || !Files.exists(dir)) return;
+        try {
+            try (var walk = Files.walk(dir)) {
+                walk.sorted((a, b) -> b.compareTo(a))
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (IOException ignored) {
+                        }
+                    });
+            }
+        } catch (IOException ignored) {
+        }
+    }
+
+    private static ModBlockSnapshotter.SnapshotResult tryCaptureSnapshotForLaunch(
+        MinecraftClient client,
+        int minX, int minY, int minZ,
+        int maxX, int maxY, int maxZ,
+        String resolvedDimension,
+        String worldName,
+        Path snapDir,
+        boolean isRu
+    ) {
+        try {
+            deleteDirQuietly(snapDir);
+            ModBlockSnapshotter.SnapshotResult res = ModBlockSnapshotter.captureRegion(
+                client,
+                new BlockPos(minX, minY, minZ),
+                new BlockPos(maxX, maxY, maxZ),
+                resolvedDimension,
+                worldName,
+                snapDir
+            );
+            sendChat(client, "§a[MCGM]§r " + res.formatSummaryLine(isRu));
+            for (String sample : res.issueSamples) {
+                sendChat(client, "§e[MCGM Snapshot]§r " + sample);
+            }
+            return res;
+        } catch (Exception e) {
+            deleteDirQuietly(snapDir);
+            String msg = isRu
+                ? "§e[MCGM] Предупреждение: не удалось создать снимок модовых блоков (" + e.getMessage() + "). Продолжаю стандартный экспорт."
+                : "§e[MCGM] Warning: failed to capture modded block snapshot (" + e.getMessage() + "). Continuing standard export.";
+            sendChat(client, msg);
+            return null;
         }
     }
 }

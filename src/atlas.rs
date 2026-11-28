@@ -564,7 +564,8 @@ pub fn build_texture_atlas(
             let (base_img, bucket, is_gray) = &base_map[&key.tex_ref];
             let mut raw_img = if let Some(tint) = key.tint_rgb {
                 let is_water = key.tex_ref.to_ascii_lowercase().contains("water");
-                if is_water || *is_gray {
+                let is_snapshot = key.tex_ref.starts_with(crate::snapshot::SNAPSHOT_TEX_PREFIX);
+                if is_water || is_snapshot || *is_gray {
                     apply_biome_tint(base_img, tint)
                 } else {
                     base_img.clone()

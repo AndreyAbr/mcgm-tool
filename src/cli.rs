@@ -171,6 +171,10 @@ pub struct CliArgs {
     /// Write live-flushed debug log to this path (defaults to <work_dir>/mcgm_debug.log)
     #[arg(long)]
     pub debug_log: Option<PathBuf>,
+
+    /// Path to a Fabric client modded block snapshot package directory (or manifest.json)
+    #[arg(long)]
+    pub mod_snapshot: Option<PathBuf>,
 }
 
 pub fn sanitize_safe_name(raw: &str, default: &str) -> String {

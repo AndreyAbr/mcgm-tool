@@ -2259,6 +2259,38 @@ pub fn stream_world_chunks_with_animated<T: Send, F>(
 where
     F: Fn(ChunkMesh) -> Result<T, String> + Sync,
 {
+    stream_world_chunks_with_snapshot(
+        grid,
+        models,
+        atlas,
+        sign_atlas,
+        features,
+        None,
+        origin_mc,
+        scale,
+        chunk_size,
+        animated_mats,
+        emit_chunk,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn stream_world_chunks_with_snapshot<T: Send, F>(
+    grid: &VoxelGrid,
+    models: &[ResolvedBlockModel],
+    atlas: &TextureAtlas,
+    sign_atlas: &SignAtlas,
+    features: &ExtractedFeatures,
+    snapshot: Option<&crate::snapshot::LoadedModSnapshot>,
+    origin_mc: [f64; 3],
+    scale: f64,
+    chunk_size: usize,
+    animated_mats: &HashMap<TexRequestKey, (String, RenderBucket)>,
+    emit_chunk: F,
+) -> Result<Vec<T>, String>
+where
+    F: Fn(ChunkMesh) -> Result<T, String> + Sync,
+{
     use rayon::prelude::*;
 
     let cs = chunk_size.max(1);
@@ -2305,6 +2337,21 @@ where
         Vec::new()
     };
     let has_flat_water_bits = !flat_water_bits.is_empty();
+    let mut snap_bits: Vec<u64> = Vec::new();
+    let mut has_snap_bits = false;
+    if let Some(snap) = snapshot {
+        if !snap.blocks_by_pos.is_empty() && !grid.blocks.is_empty() {
+            snap_bits.resize(grid.blocks.len().div_ceil(64), 0);
+            for &(vx, vy, vz) in snap.blocks_by_pos.keys() {
+                if snap.is_covered_block(vx, vy, vz) {
+                    if let Some(idx) = grid.index(vx, vy, vz) {
+                        snap_bits[idx >> 6] |= 1u64 << (idx & 63);
+                        has_snap_bits = true;
+                    }
+                }
+            }
+        }
+    }
     let ox = origin_mc[0];
     let oy = origin_mc[1];
     let oz = origin_mc[2];
@@ -2332,16 +2379,103 @@ where
                     let row = (gy * sz + gz) * sx;
                     for gx in x0..x1 {
                         let v_idx = row + gx;
+                        if has_skip_bits && ((features.skip_mesh_bits[v_idx >> 6] >> (v_idx & 63)) & 1) != 0 {
+                            continue;
+                        }
+                        let wx = c.min_x + gx as i32;
+                        if has_snap_bits && ((snap_bits[v_idx >> 6] >> (v_idx & 63)) & 1) != 0 {
+                            if let Some(snap) = snapshot {
+                                if let Some(entry) = snap.covered_block(wx, wy, wz) {
+                                    if let Some(ref mesh_id) = entry.mesh_id {
+                                        if let Some(tris) = snap.meshes.get(mesh_id) {
+                                            for st in tris {
+                                                let uv_rect = atlas.get_or_default(&TexRequestKey {
+                                                    tex_ref: crate::snapshot::snapshot_tex_ref(&st.texture_id),
+                                                    tint_rgb: st.tint_rgb,
+                                                });
+                                                let (mat, is_translucent) = match st.render_layer {
+                                                    crate::snapshot::SnapshotRenderLayer::Translucent => {
+                                                        (Cow::Borrowed("terrain_translucent"), true)
+                                                    }
+                                                    crate::snapshot::SnapshotRenderLayer::Cutout => {
+                                                        has_cutout = true;
+                                                        (Cow::Borrowed("terrain_cutout"), false)
+                                                    }
+                                                    crate::snapshot::SnapshotRenderLayer::Solid => {
+                                                        match uv_rect.bucket {
+                                                            RenderBucket::TerrainTranslucent => {
+                                                                (Cow::Borrowed("terrain_translucent"), true)
+                                                            }
+                                                            RenderBucket::TerrainCutout
+                                                            | RenderBucket::TerrainCutoutCull => {
+                                                                has_cutout = true;
+                                                                (Cow::Borrowed(uv_rect.bucket.material_name()), false)
+                                                            }
+                                                            RenderBucket::TerrainOpaque => {
+                                                                (Cow::Borrowed("terrain_opaque"), false)
+                                                            }
+                                                        }
+                                                    }
+                                                };
+                                                let p0 = mc_point_to_source(
+                                                    [
+                                                        wx as f64 + st.pos[0][0] as f64,
+                                                        wy as f64 + st.pos[0][1] as f64,
+                                                        wz as f64 + st.pos[0][2] as f64,
+                                                    ],
+                                                    origin_mc,
+                                                    scale,
+                                                );
+                                                let p1 = mc_point_to_source(
+                                                    [
+                                                        wx as f64 + st.pos[1][0] as f64,
+                                                        wy as f64 + st.pos[1][1] as f64,
+                                                        wz as f64 + st.pos[1][2] as f64,
+                                                    ],
+                                                    origin_mc,
+                                                    scale,
+                                                );
+                                                let p2 = mc_point_to_source(
+                                                    [
+                                                        wx as f64 + st.pos[2][0] as f64,
+                                                        wy as f64 + st.pos[2][1] as f64,
+                                                        wz as f64 + st.pos[2][2] as f64,
+                                                    ],
+                                                    origin_mc,
+                                                    scale,
+                                                );
+                                                expand_bounds(&mut bmin, &mut bmax, p0);
+                                                expand_bounds(&mut bmin, &mut bmax, p1);
+                                                expand_bounds(&mut bmin, &mut bmax, p2);
+                                                let n_src = mc_normal_to_source(st.normal);
+                                                let tri = MeshTri {
+                                                    material: mat,
+                                                    pos: [p0, p1, p2],
+                                                    norm: [n_src; 3],
+                                                    uv: [
+                                                        uv_rect.map_uv(st.uv[0][0], st.uv[0][1]),
+                                                        uv_rect.map_uv(st.uv[1][0], st.uv[1][1]),
+                                                        uv_rect.map_uv(st.uv[2][0], st.uv[2][1]),
+                                                    ],
+                                                };
+                                                if is_translucent {
+                                                    translucent_tris.push(tri);
+                                                } else {
+                                                    solid_tris.push(tri);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         let pid = grid.blocks[v_idx] as usize;
                         if pid == grid.air_id as usize || grid.palette[pid].is_air {
                             continue;
                         }
-                        if has_skip_bits && ((features.skip_mesh_bits[v_idx >> 6] >> (v_idx & 63)) & 1) != 0 {
-                            continue;
-                        }
                         let in_flat_water = has_flat_water_bits
                             && ((flat_water_bits[v_idx >> 6] >> (v_idx & 63)) & 1) != 0;
-                        let wx = c.min_x + gx as i32;
 
                         // Special geometry for sign text panels
                         if palette_is_sign[pid] {
@@ -2401,19 +2535,23 @@ where
                                         continue;
                                     }
                                     if let Some(cull_dir) = bf.cull_dir {
-                                        let nb_pid = grid.get_block_id(
-                                            wx + bf.cull_off[0],
-                                            wy + bf.cull_off[1],
-                                            wz + bf.cull_off[2],
-                                        ) as usize;
+                                        let nx = wx + bf.cull_off[0];
+                                        let ny = wy + bf.cull_off[1];
+                                        let nz = wz + bf.cull_off[2];
+                                        let nb_covered_by_snapshot = has_snap_bits
+                                            && snapshot.is_some_and(|s| s.is_covered_block(nx, ny, nz));
+                                        let nb_pid = grid.get_block_id(nx, ny, nz) as usize;
                                         let nb_cull = cull_info[nb_pid];
                                         if bf.is_water_overlay {
-                                            if (nb_cull.flags & CULL_AIR) == 0
+                                            if !nb_covered_by_snapshot
+                                                && (nb_cull.flags & CULL_AIR) == 0
                                                 && (nb_cull.flags & (CULL_WATER_HOST | CULL_OCCLUDER)) != 0
                                             {
                                                 continue;
                                             }
-                                        } else if should_cull_pid(self_cull, nb_cull, cull_dir) {
+                                        } else if !nb_covered_by_snapshot
+                                            && should_cull_pid(self_cull, nb_cull, cull_dir)
+                                        {
                                             continue;
                                         }
                                     }

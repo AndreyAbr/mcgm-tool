@@ -169,6 +169,26 @@ public class McgmBridgeMod implements ClientModInitializer {
                         return 1;
                     })
                 )
+                .then(ClientCommandManager.literal("snapshot")
+                    .executes(context -> {
+                        SelectionManager sm = SelectionManager.getInstance();
+                        MinecraftClient client = context.getSource().getClient();
+                        if (sm.getMinPos() == null || sm.getMaxPos() == null) {
+                            context.getSource().sendFeedback(Text.literal("§c[MCGM] Select two corners first with /mcgm pos1 and /mcgm pos2."));
+                            return 0;
+                        }
+                        Exporter.ScreenSettings saved = Exporter.loadScreenSettings(client);
+                        Exporter.captureSnapshotStandalone(
+                            client,
+                            sm.getMinPos().getX(), sm.getMinPos().getY(), sm.getMinPos().getZ(),
+                            sm.getMaxPos().getX(), sm.getMaxPos().getY(), sm.getMaxPos().getZ(),
+                            saved.dimensionMode,
+                            saved.worldOverride,
+                            saved.languageMode
+                        );
+                        return 1;
+                    })
+                )
             );
         });
 

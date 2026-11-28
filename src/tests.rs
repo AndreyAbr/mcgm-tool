@@ -2572,6 +2572,7 @@ mod suite {
             door_count: 3,
             total_secs: 4.5,
             stage_timings: vec![],
+            mod_snapshot_report: None,
         };
         let ru = format_done_summary(UiLang::Ru, &summary_with_gma);
         assert!(ru.contains("Готово") && ru.contains("GMA") && ru.contains("Чанк"));
@@ -5653,6 +5654,7 @@ mod suite {
             door_count: 1,
             total_secs: 1.5,
             stage_timings: vec![],
+            mod_snapshot_report: None,
         };
         let ru = format_done_summary(UiLang::Ru, &summary_gma_err);
         let en = format_done_summary(UiLang::En, &summary_gma_err);
@@ -6418,6 +6420,7 @@ mod suite {
             door_count: 2,
             total_secs: 3.25,
             stage_timings: vec![],
+            mod_snapshot_report: None,
         };
         assert_eq!(ok_summary.outcome_status(), crate::ExportOutcomeStatus::Success);
         assert_eq!(ok_summary.outcome_status().exit_code(), crate::EXIT_CODE_SUCCESS);
@@ -6431,6 +6434,7 @@ mod suite {
             door_count: 2,
             total_secs: 3.25,
             stage_timings: vec![],
+            mod_snapshot_report: None,
         };
         assert_eq!(partial.outcome_status(), crate::ExportOutcomeStatus::PartialSuccess);
         assert_eq!(
@@ -6698,6 +6702,645 @@ mod suite {
         let gma_txt = String::from_utf8_lossy(&gma_bytes);
         assert!(gma_txt.contains("lua/autorun/mcgm_parkour.lua"));
         assert!(gma_txt.contains("lua/mcgm_parkour/gm_parkour_test.lua"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn write_test_png_bytes(rgba: [u8; 4]) -> Vec<u8> {
+        encode_png_bytes(&ImageBuffer::from_pixel(16, 16, Rgba(rgba)))
+    }
+
+    #[test]
+    fn test_mod_snapshot_manifest_validation_version_coords_dim_bounds_and_files() {
+        use crate::snapshot::{LoadedModSnapshot, SNAPSHOT_COORD_SYSTEM, SNAPSHOT_FORMAT_VERSION};
+
+        let tmp = make_temp_test_dir("mod_snap_validate");
+        let snap_dir = tmp.join("snap");
+        std::fs::create_dir_all(snap_dir.join("textures")).unwrap();
+        std::fs::create_dir_all(snap_dir.join("meshes")).unwrap();
+
+        let tex_bytes = write_test_png_bytes([180, 140, 90, 255]);
+        std::fs::write(snap_dir.join("textures/tex_0000.png"), &tex_bytes).unwrap();
+        let mesh_json = serde_json::json!({
+            "id": "mesh_0000",
+            "triangles": [{
+                "pos": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                "normal": [0.0, 0.0, 1.0],
+                "uv": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+                "texture_id": "tex_0000",
+                "render_layer": "solid",
+                "tint_rgb": null
+            }]
+        });
+        std::fs::write(
+            snap_dir.join("meshes/mesh_0000.json"),
+            serde_json::to_string_pretty(&mesh_json).unwrap(),
+        )
+        .unwrap();
+
+        let base_manifest = |ver: u32, cs: &str, dim: &str, bounds: [i32; 6], tex_path: &str, mesh_path: &str| {
+            serde_json::json!({
+                "format_version": ver,
+                "coord_system": cs,
+                "dimension": dim,
+                "world_name": "TestWorld",
+                "bounds": {
+                    "min_x": bounds[0], "min_y": bounds[1], "min_z": bounds[2],
+                    "max_x": bounds[3], "max_y": bounds[4], "max_z": bounds[5]
+                },
+                "summary": {
+                    "captured_blocks": 1, "full_blocks": 1, "partial_blocks": 0, "fallback_blocks": 0,
+                    "unique_meshes": 1, "unique_textures": 1
+                },
+                "textures": [{"id": "tex_0000", "path": tex_path, "source_id": "unknownmod:block/frame", "width": 16, "height": 16}],
+                "meshes": [{"id": "mesh_0000", "path": mesh_path, "triangle_count": 1}],
+                "blocks": [{
+                    "x": 1, "y": 64, "z": 1,
+                    "block_id": "unknownmod:frame",
+                    "has_block_entity": false,
+                    "capture_status": "full",
+                    "capture_reason": null,
+                    "mesh_id": "mesh_0000",
+                    "has_collision": true,
+                    "collision_boxes": [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]
+                }]
+            })
+        };
+
+        let export_coords = WorldCoords {
+            min_x: 0,
+            min_y: 63,
+            min_z: 0,
+            max_x: 3,
+            max_y: 66,
+            max_z: 3,
+        };
+
+        let manifest_path = snap_dir.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&base_manifest(
+                SNAPSHOT_FORMAT_VERSION,
+                SNAPSHOT_COORD_SYSTEM,
+                "minecraft:overworld",
+                [0, 63, 0, 3, 66, 3],
+                "textures/tex_0000.png",
+                "meshes/mesh_0000.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = LoadedModSnapshot::load_and_validate(&snap_dir, &export_coords, "overworld")
+            .expect("valid v1 snapshot must load");
+        assert_eq!(loaded.report.covered_blocks, 1);
+        assert_eq!(loaded.report.full_blocks, 1);
+
+        // Wrong version
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&base_manifest(
+                99,
+                SNAPSHOT_COORD_SYSTEM,
+                "minecraft:overworld",
+                [0, 63, 0, 3, 66, 3],
+                "textures/tex_0000.png",
+                "meshes/mesh_0000.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(LoadedModSnapshot::load_and_validate(&snap_dir, &export_coords, "overworld").is_err());
+
+        // Wrong coord_system
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&base_manifest(
+                SNAPSHOT_FORMAT_VERSION,
+                "z_up_rhs",
+                "minecraft:overworld",
+                [0, 63, 0, 3, 66, 3],
+                "textures/tex_0000.png",
+                "meshes/mesh_0000.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(LoadedModSnapshot::load_and_validate(&snap_dir, &export_coords, "overworld").is_err());
+
+        // Dimension mismatch
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&base_manifest(
+                SNAPSHOT_FORMAT_VERSION,
+                SNAPSHOT_COORD_SYSTEM,
+                "minecraft:the_nether",
+                [0, 63, 0, 3, 66, 3],
+                "textures/tex_0000.png",
+                "meshes/mesh_0000.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(LoadedModSnapshot::load_and_validate(&snap_dir, &export_coords, "overworld").is_err());
+
+        // Disjoint bounds
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&base_manifest(
+                SNAPSHOT_FORMAT_VERSION,
+                SNAPSHOT_COORD_SYSTEM,
+                "minecraft:overworld",
+                [50, 63, 50, 55, 66, 55],
+                "textures/tex_0000.png",
+                "meshes/mesh_0000.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(LoadedModSnapshot::load_and_validate(&snap_dir, &export_coords, "overworld").is_err());
+
+        // Unsafe parent path traversal
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&base_manifest(
+                SNAPSHOT_FORMAT_VERSION,
+                SNAPSHOT_COORD_SYSTEM,
+                "minecraft:overworld",
+                [0, 63, 0, 3, 66, 3],
+                "../secret.png",
+                "meshes/mesh_0000.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(LoadedModSnapshot::load_and_validate(&snap_dir, &export_coords, "overworld").is_err());
+
+        // Missing referenced mesh file
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&base_manifest(
+                SNAPSHOT_FORMAT_VERSION,
+                SNAPSHOT_COORD_SYSTEM,
+                "minecraft:overworld",
+                [0, 63, 0, 3, 66, 3],
+                "textures/tex_0000.png",
+                "meshes/missing.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(LoadedModSnapshot::load_and_validate(&snap_dir, &export_coords, "overworld").is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_mod_snapshot_diff_geometry_same_block_id_and_mesh_dedup() {
+        use crate::assets::{FaceDir, ModelElement, ModelFace, ResolvedBlockModel};
+        use crate::atlas::{build_texture_atlas, FontRenderer, SignAtlas};
+        use crate::mesher::{extract_features_and_requests, stream_world_chunks_with_snapshot};
+        use crate::snapshot::{LoadedModSnapshot, SNAPSHOT_COORD_SYSTEM, SNAPSHOT_FORMAT_VERSION};
+
+        let tmp = make_temp_test_dir("mod_snap_diff_geom");
+        let snap_dir = tmp.join("snap");
+        std::fs::create_dir_all(snap_dir.join("textures")).unwrap();
+        std::fs::create_dir_all(snap_dir.join("meshes")).unwrap();
+
+        std::fs::write(snap_dir.join("textures/tex_0000.png"), write_test_png_bytes([120, 120, 120, 255])).unwrap();
+        // Straight pipe mesh: triangle inside [0.25..0.75]
+        let mesh0 = serde_json::json!({
+            "id": "mesh_0000",
+            "triangles": [{
+                "pos": [[0.25, 0.25, 0.0], [0.75, 0.25, 0.0], [0.75, 0.75, 1.0]],
+                "normal": [0.0, 1.0, 0.0],
+                "uv": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+                "texture_id": "tex_0000",
+                "render_layer": "solid",
+                "tint_rgb": null
+            }]
+        });
+        // Corner pipe mesh for SAME block_id ("unknownmod:pipe"), distinct vertex coords
+        let mesh1 = serde_json::json!({
+            "id": "mesh_0001",
+            "triangles": [{
+                "pos": [[0.0, 0.1, 0.25], [0.9, 0.1, 0.75], [0.5, 0.9, 0.75]],
+                "normal": [0.0, 0.0, 1.0],
+                "uv": [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+                "texture_id": "tex_0000",
+                "render_layer": "cutout",
+                "tint_rgb": null
+            }]
+        });
+        std::fs::write(snap_dir.join("meshes/mesh_0000.json"), serde_json::to_string(&mesh0).unwrap()).unwrap();
+        std::fs::write(snap_dir.join("meshes/mesh_0001.json"), serde_json::to_string(&mesh1).unwrap()).unwrap();
+
+        let manifest = serde_json::json!({
+            "format_version": SNAPSHOT_FORMAT_VERSION,
+            "coord_system": SNAPSHOT_COORD_SYSTEM,
+            "dimension": "minecraft:overworld",
+            "bounds": {"min_x": 0, "min_y": 64, "min_z": 0, "max_x": 3, "max_y": 64, "max_z": 1},
+            "textures": [{"id": "tex_0000", "path": "textures/tex_0000.png", "source_id": "unknownmod:block/pipe", "width": 16, "height": 16}],
+            "meshes": [
+                {"id": "mesh_0000", "path": "meshes/mesh_0000.json", "triangle_count": 1},
+                {"id": "mesh_0001", "path": "meshes/mesh_0001.json", "triangle_count": 1}
+            ],
+            "blocks": [
+                {"x": 1, "y": 64, "z": 1, "block_id": "unknownmod:pipe", "has_block_entity": false, "capture_status": "full", "capture_reason": null, "mesh_id": "mesh_0000", "has_collision": true, "collision_boxes": [[0.25, 0.0, 0.25, 0.75, 1.0, 0.75]]},
+                {"x": 2, "y": 64, "z": 1, "block_id": "unknownmod:pipe", "has_block_entity": false, "capture_status": "full", "capture_reason": null, "mesh_id": "mesh_0000", "has_collision": true, "collision_boxes": [[0.25, 0.0, 0.25, 0.75, 1.0, 0.75]]},
+                {"x": 3, "y": 64, "z": 1, "block_id": "unknownmod:pipe", "has_block_entity": false, "capture_status": "full", "capture_reason": null, "mesh_id": "mesh_0001", "has_collision": true, "collision_boxes": [[0.0, 0.0, 0.25, 0.75, 1.0, 0.75]]}
+            ]
+        });
+        std::fs::write(snap_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+
+        let coords = WorldCoords { min_x: 0, min_y: 64, min_z: 0, max_x: 3, max_y: 64, max_z: 1 };
+        let snap = LoadedModSnapshot::load_and_validate(&snap_dir, &coords, "overworld").unwrap();
+        assert_eq!(snap.report.unique_meshes, 2);
+        assert_eq!(snap.report.covered_blocks, 3);
+
+        let air = make_state("minecraft:air", &[]);
+        let stone = make_state("minecraft:stone", &[]);
+        let pipe = make_state("unknownmod:pipe", &[]);
+        let mut grid = VoxelGrid {
+            coords,
+            palette: vec![air, stone, pipe],
+            air_id: 0,
+            blocks: vec![0; coords.size_x() * coords.size_y() * coords.size_z()],
+            biome_palette: vec!["minecraft:plains".to_string()],
+            biomes: vec![0; coords.size_x() * coords.size_y() * coords.size_z()],
+            signs: HashMap::new(),
+            player_spawn_mc: None,
+        };
+        grid.blocks[grid.index(0, 64, 1).unwrap()] = 1; // vanilla stone neighbor
+        grid.blocks[grid.index(1, 64, 1).unwrap()] = 2; // straight pipe A
+        grid.blocks[grid.index(2, 64, 1).unwrap()] = 2; // straight pipe B
+        grid.blocks[grid.index(3, 64, 1).unwrap()] = 2; // corner pipe C
+
+        // Even if Rust had a fallback model for unknownmod:pipe, snapshot must replace it cleanly with zero duplicates
+        let mut cube_faces = HashMap::new();
+        for dir in [FaceDir::North, FaceDir::South, FaceDir::East, FaceDir::West, FaceDir::Up, FaceDir::Down] {
+            cube_faces.insert(dir, ModelFace {
+                uv: Some([0.0, 0.0, 16.0, 16.0]),
+                texture: "minecraft:block/stone".to_string(),
+                rotation: 0,
+                tint_index: None,
+                cullface: None,
+            });
+        }
+        let cube_model = ResolvedBlockModel::Elements(vec![ModelElement {
+            from: [0.0, 0.0, 0.0],
+            to: [16.0, 16.0, 16.0],
+            rotation: None,
+            faces: cube_faces,
+            rot_x: 0,
+            rot_y: 0,
+            rot_z: 0,
+            uvlock: false,
+        }]);
+        let models = vec![ResolvedBlockModel::Empty, cube_model.clone(), cube_model];
+
+        let origin_mc = [0.0, 64.0, 0.0];
+        let scale = 39.37;
+        let (feat, mut reqs) = extract_features_and_requests(&grid, &models, origin_mc, scale);
+        reqs.extend(snap.collect_tex_requests());
+        let mut assets = AssetIndex::empty();
+        snap.register_textures(&mut assets);
+        let atlas = build_texture_atlas(&reqs, &assets, 8);
+        let sign_atlas = SignAtlas { image: ImageBuffer::new(16, 16), rects: HashMap::new() };
+        let _ = FontRenderer::from_assets(&assets);
+
+        let chunks: Vec<crate::mesher::ChunkMesh> = stream_world_chunks_with_snapshot(
+            &grid, &models, &atlas, &sign_atlas, &feat, Some(&snap), origin_mc, scale, 16, &HashMap::new(), Ok
+        )
+        .unwrap();
+        assert_eq!(chunks.len(), 1);
+        let tris = &chunks[0].solid_tris;
+        // Stone cube (12 tris, including East face bordering snapshot) + 3 snapshot pipes * 1 tri = 15 tris total
+        assert_eq!(tris.len(), 15, "Expected 12 stone tris + 3 snapshot pipe tris with zero duplicate cubes");
+
+        // Corner pipe at x=3 must contain its high y_mc=0.9 vertex -> z_src = 0.9 * scale
+        let corner_z_src = (0.9 * scale) as f32;
+        assert!(
+            tris.iter().any(|t| t.pos.iter().any(|p| p[0] > 3.0 * scale as f32 && (p[2] - corner_z_src).abs() < 1e-2)),
+            "Corner pipe geometry missing for second shape under same block_id"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_mod_snapshot_empty_collision_and_custom_boxes_no_duplicate() {
+        use crate::assets::{FaceDir, ModelElement, ModelFace, ResolvedBlockModel};
+        use crate::collision::build_world_collision_with_snapshot;
+        use crate::snapshot::{LoadedModSnapshot, SNAPSHOT_COORD_SYSTEM, SNAPSHOT_FORMAT_VERSION};
+
+        let tmp = make_temp_test_dir("mod_snap_collision");
+        let snap_dir = tmp.join("snap");
+        std::fs::create_dir_all(snap_dir.join("textures")).unwrap();
+        std::fs::create_dir_all(snap_dir.join("meshes")).unwrap();
+        std::fs::write(snap_dir.join("textures/tex_0000.png"), write_test_png_bytes([90, 200, 90, 255])).unwrap();
+        let mesh0 = serde_json::json!({
+            "id": "mesh_0000",
+            "triangles": [{
+                "pos": [[0.2, 0.0, 0.2], [0.8, 0.0, 0.2], [0.5, 0.8, 0.5]],
+                "normal": [0.0, 1.0, 0.0],
+                "uv": [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+                "texture_id": "tex_0000",
+                "render_layer": "cutout",
+                "tint_rgb": null
+            }]
+        });
+        std::fs::write(snap_dir.join("meshes/mesh_0000.json"), serde_json::to_string(&mesh0).unwrap()).unwrap();
+
+        let manifest = serde_json::json!({
+            "format_version": SNAPSHOT_FORMAT_VERSION,
+            "coord_system": SNAPSHOT_COORD_SYSTEM,
+            "dimension": "minecraft:overworld",
+            "bounds": {"min_x": 0, "min_y": 64, "min_z": 0, "max_x": 3, "max_y": 64, "max_z": 2},
+            "textures": [{"id": "tex_0000", "path": "textures/tex_0000.png", "source_id": "unknownmod:block/chair", "width": 16, "height": 16}],
+            "meshes": [{"id": "mesh_0000", "path": "meshes/mesh_0000.json", "triangle_count": 1}],
+            "blocks": [
+                {"x": 1, "y": 64, "z": 1, "block_id": "unknownmod:ghost_flower", "has_block_entity": false, "capture_status": "full", "capture_reason": null, "mesh_id": "mesh_0000", "has_collision": false, "collision_boxes": []},
+                {"x": 2, "y": 64, "z": 1, "block_id": "unknownmod:chair", "has_block_entity": false, "capture_status": "full", "capture_reason": null, "mesh_id": "mesh_0000", "has_collision": true, "collision_boxes": [
+                    [0.1, 0.0, 0.1, 0.9, 0.5, 0.9],
+                    [0.1, 0.5, 0.1, 0.9, 1.0, 0.3]
+                ]}
+            ]
+        });
+        std::fs::write(snap_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+
+        let coords = WorldCoords { min_x: 0, min_y: 64, min_z: 0, max_x: 3, max_y: 64, max_z: 2 };
+        let snap = LoadedModSnapshot::load_and_validate(&snap_dir, &coords, "overworld").unwrap();
+
+        let air = make_state("minecraft:air", &[]);
+        // Even if the Rust grid thought these unknown blocks were full cubes, snapshot overrides must rule
+        let flower = make_state("unknownmod:ghost_flower", &[]);
+        let chair = make_state("unknownmod:chair", &[]);
+        let mut grid = VoxelGrid {
+            coords,
+            palette: vec![air, flower, chair],
+            air_id: 0,
+            blocks: vec![0; coords.size_x() * coords.size_y() * coords.size_z()],
+            biome_palette: vec!["minecraft:plains".to_string()],
+            biomes: vec![0; coords.size_x() * coords.size_y() * coords.size_z()],
+            signs: HashMap::new(),
+            player_spawn_mc: None,
+        };
+        grid.blocks[grid.index(1, 64, 1).unwrap()] = 1;
+        grid.blocks[grid.index(2, 64, 1).unwrap()] = 2;
+
+        let mut cube_faces = HashMap::new();
+        for dir in [FaceDir::North, FaceDir::South, FaceDir::East, FaceDir::West, FaceDir::Up, FaceDir::Down] {
+            cube_faces.insert(dir, ModelFace { uv: None, texture: "minecraft:block/stone".into(), rotation: 0, tint_index: None, cullface: None });
+        }
+        let fake_full_model = ResolvedBlockModel::Elements(vec![ModelElement {
+            from: [0.0, 0.0, 0.0],
+            to: [16.0, 16.0, 16.0],
+            rotation: None,
+            faces: cube_faces,
+            rot_x: 0,
+            rot_y: 0,
+            rot_z: 0,
+            uvlock: false,
+        }]);
+        let models = vec![ResolvedBlockModel::Empty, fake_full_model.clone(), fake_full_model];
+
+        let scale = 40.0;
+        let col = build_world_collision_with_snapshot(&grid, Some(&models), Some(&snap), [0.0, 64.0, 0.0], scale, 16);
+        assert_eq!(col.all_solid_boxes.len(), 2, "Empty collision block produces 0 boxes, chair produces its 2 exact boxes");
+        // Verify neither box overlaps voxel (1, 64, 1) -> x_src in [40..80]
+        assert!(col.all_solid_boxes.iter().all(|b| b.box_coords[0] >= 2.0 * scale));
+        // Verify chair backrest height equals 1.0 * scale and seat depth matches custom boxes
+        assert!((col.all_solid_boxes[0].box_coords[5] - 0.5 * scale).abs() < 1e-6);
+        assert!((col.all_solid_boxes[1].box_coords[5] - 1.0 * scale).abs() < 1e-6);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_mod_snapshot_partial_and_fallback_behavior_and_summary() {
+        use crate::assets::{FaceDir, ModelElement, ModelFace, ResolvedBlockModel};
+        use crate::atlas::{build_texture_atlas, FontRenderer, SignAtlas};
+        use crate::collision::build_world_collision_with_snapshot;
+        use crate::mesher::{extract_features_and_requests, stream_world_chunks_with_snapshot};
+        use crate::snapshot::{LoadedModSnapshot, SNAPSHOT_COORD_SYSTEM, SNAPSHOT_FORMAT_VERSION};
+
+        let tmp = make_temp_test_dir("mod_snap_partial_fallback");
+        let snap_dir = tmp.join("snap");
+        std::fs::create_dir_all(snap_dir.join("textures")).unwrap();
+        std::fs::create_dir_all(snap_dir.join("meshes")).unwrap();
+        std::fs::write(snap_dir.join("textures/tex_0000.png"), write_test_png_bytes([60, 140, 220, 180])).unwrap();
+        let mesh0 = serde_json::json!({
+            "id": "mesh_0000",
+            "triangles": [{
+                "pos": [[0.1, 0.1, 0.1], [0.9, 0.1, 0.1], [0.9, 0.6, 0.9]],
+                "normal": [0.0, 1.0, 0.0],
+                "uv": [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+                "texture_id": "tex_0000",
+                "render_layer": "translucent",
+                "tint_rgb": null
+            }]
+        });
+        std::fs::write(snap_dir.join("meshes/mesh_0000.json"), serde_json::to_string(&mesh0).unwrap()).unwrap();
+
+        let manifest = serde_json::json!({
+            "format_version": SNAPSHOT_FORMAT_VERSION,
+            "coord_system": SNAPSHOT_COORD_SYSTEM,
+            "dimension": "minecraft:overworld",
+            "bounds": {"min_x": 0, "min_y": 64, "min_z": 0, "max_x": 3, "max_y": 64, "max_z": 1},
+            "textures": [{"id": "tex_0000", "path": "textures/tex_0000.png", "source_id": "unknownmod:block/tank", "width": 16, "height": 16}],
+            "meshes": [{"id": "mesh_0000", "path": "meshes/mesh_0000.json", "triangle_count": 1}],
+            "blocks": [
+                {"x": 1, "y": 64, "z": 1, "block_id": "unknownmod:tank", "has_block_entity": true, "capture_status": "partial", "capture_reason": "BER used LINES", "mesh_id": "mesh_0000", "has_collision": true, "collision_boxes": [[0.1, 0.0, 0.1, 0.9, 0.9, 0.9]]},
+                {"x": 2, "y": 64, "z": 1, "block_id": "minecraft:stone", "has_block_entity": true, "capture_status": "fallback", "capture_reason": "Custom shader BER", "mesh_id": null, "has_collision": true, "collision_boxes": [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]}
+            ]
+        });
+        std::fs::write(snap_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+
+        let coords = WorldCoords { min_x: 0, min_y: 64, min_z: 0, max_x: 3, max_y: 64, max_z: 1 };
+        let snap = LoadedModSnapshot::load_and_validate(&snap_dir, &coords, "overworld").unwrap();
+        assert_eq!(snap.report.covered_blocks, 1);
+        assert_eq!(snap.report.full_blocks, 0);
+        assert_eq!(snap.report.partial_blocks, 1);
+        assert_eq!(snap.report.fallback_blocks, 1);
+        assert!(snap.report.partial_or_fallback_samples.iter().any(|s| s.contains("BER used LINES")));
+        assert!(snap.report.partial_or_fallback_samples.iter().any(|s| s.contains("Custom shader BER")));
+
+        let log_line = snap.report.format_log_line();
+        assert!(log_line.contains("1 covered (0 full, 1 partial), 1 fallback"));
+
+        let summary = crate::PipelineSummary {
+            bsp_path: std::path::PathBuf::from("out/map.bsp"),
+            gma_path: None,
+            gma_error: None,
+            chunk_count: 1,
+            door_count: 0,
+            total_secs: 1.0,
+            stage_timings: vec![],
+            mod_snapshot_report: Some(snap.report.clone()),
+        };
+        assert!(summary.format_cli_report().contains(&log_line));
+
+        // Fallback block must keep Rust's legacy stone mesh + collision; Partial block must replace legacy stone
+        let air = make_state("minecraft:air", &[]);
+        let stone = make_state("minecraft:stone", &[]);
+        let tank = make_state("unknownmod:tank", &[]);
+        let mut grid = VoxelGrid {
+            coords,
+            palette: vec![air, stone, tank],
+            air_id: 0,
+            blocks: vec![0; coords.size_x() * coords.size_y() * coords.size_z()],
+            biome_palette: vec!["minecraft:plains".to_string()],
+            biomes: vec![0; coords.size_x() * coords.size_y() * coords.size_z()],
+            signs: HashMap::new(),
+            player_spawn_mc: None,
+        };
+        grid.blocks[grid.index(1, 64, 1).unwrap()] = 2; // partial
+        grid.blocks[grid.index(2, 64, 1).unwrap()] = 1; // fallback vanilla stone
+
+        let mut cube_faces = HashMap::new();
+        for dir in [FaceDir::North, FaceDir::South, FaceDir::East, FaceDir::West, FaceDir::Up, FaceDir::Down] {
+            cube_faces.insert(dir, ModelFace { uv: None, texture: "minecraft:block/stone".into(), rotation: 0, tint_index: None, cullface: None });
+        }
+        let cube_model = ResolvedBlockModel::Elements(vec![ModelElement {
+            from: [0.0, 0.0, 0.0],
+            to: [16.0, 16.0, 16.0],
+            rotation: None,
+            faces: cube_faces,
+            rot_x: 0,
+            rot_y: 0,
+            rot_z: 0,
+            uvlock: false,
+        }]);
+        let models = vec![ResolvedBlockModel::Empty, cube_model.clone(), cube_model];
+
+        let origin = [0.0, 64.0, 0.0];
+        let scale = 39.37;
+        let col = build_world_collision_with_snapshot(&grid, Some(&models), Some(&snap), origin, scale, 16);
+        // 1 custom tank box at x=1 (top=0.9*scale) + 1 fallback stone box at x=2 (top=1.0*scale)
+        assert_eq!(col.all_solid_boxes.len(), 2);
+
+        let (feat, mut reqs) = extract_features_and_requests(&grid, &models, origin, scale);
+        reqs.extend(snap.collect_tex_requests());
+        let mut assets = AssetIndex::empty();
+        snap.register_textures(&mut assets);
+        let atlas = build_texture_atlas(&reqs, &assets, 8);
+        let sign_atlas = SignAtlas { image: ImageBuffer::new(16, 16), rects: HashMap::new() };
+        let _ = FontRenderer::from_assets(&assets);
+        let chunks: Vec<crate::mesher::ChunkMesh> = stream_world_chunks_with_snapshot(
+            &grid, &models, &atlas, &sign_atlas, &feat, Some(&snap), origin, scale, 16, &HashMap::new(), Ok
+        )
+        .unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].translucent_tris.len(), 1, "Partial tank translucent tri must be emitted");
+        assert_eq!(chunks[0].solid_tris.len(), 12, "Fallback block must keep legacy stone cube tris");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_mod_snapshot_asymmetric_transform_tint_and_cli_gui_plumbing() {
+        use crate::assets::ResolvedBlockModel;
+        use crate::atlas::{build_texture_atlas, FontRenderer, SignAtlas};
+        use crate::gui::resolve_gui_pipeline_options;
+        use crate::mesher::{extract_features_and_requests, stream_world_chunks_with_snapshot};
+        use crate::snapshot::{snapshot_tex_ref, LoadedModSnapshot, SNAPSHOT_COORD_SYSTEM, SNAPSHOT_FORMAT_VERSION};
+        use clap::{CommandFactory, FromArgMatches};
+
+        let tmp = make_temp_test_dir("mod_snap_xform_tint");
+        let snap_dir = tmp.join("snap");
+        std::fs::create_dir_all(snap_dir.join("textures")).unwrap();
+        std::fs::create_dir_all(snap_dir.join("meshes")).unwrap();
+
+        // Non-grayscale texture must STILL be tinted for mcgm_snapshot:
+        std::fs::write(snap_dir.join("textures/tex_0000.png"), write_test_png_bytes([200, 160, 120, 255])).unwrap();
+        let mesh0 = serde_json::json!({
+            "id": "mesh_0000",
+            "triangles": [{
+                "pos": [[0.1, 0.2, 0.3], [0.9, 0.2, 0.3], [0.2, 0.8, 0.7]],
+                "normal": [0.0, 0.6, 0.8],
+                "uv": [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+                "texture_id": "tex_0000",
+                "render_layer": "solid",
+                "tint_rgb": [128, 255, 64]
+            }]
+        });
+        std::fs::write(snap_dir.join("meshes/mesh_0000.json"), serde_json::to_string(&mesh0).unwrap()).unwrap();
+        let manifest = serde_json::json!({
+            "format_version": SNAPSHOT_FORMAT_VERSION,
+            "coord_system": SNAPSHOT_COORD_SYSTEM,
+            "dimension": "minecraft:overworld",
+            "bounds": {"min_x": 12, "min_y": 62, "min_z": -3, "max_x": 12, "max_y": 62, "max_z": -3},
+            "textures": [{"id": "tex_0000", "path": "textures/tex_0000.png", "source_id": "unknownmod:block/leaf", "width": 16, "height": 16}],
+            "meshes": [{"id": "mesh_0000", "path": "meshes/mesh_0000.json", "triangle_count": 1}],
+            "blocks": [
+                {"x": 12, "y": 62, "z": -3, "block_id": "unknownmod:leaf", "has_block_entity": false, "capture_status": "full", "capture_reason": null, "mesh_id": "mesh_0000", "has_collision": false, "collision_boxes": []}
+            ]
+        });
+        std::fs::write(snap_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+
+        let coords = WorldCoords { min_x: 12, min_y: 62, min_z: -3, max_x: 12, max_y: 62, max_z: -3 };
+        let snap = LoadedModSnapshot::load_and_validate(&snap_dir, &coords, "overworld").unwrap();
+
+        let mut assets = AssetIndex::empty();
+        snap.register_textures(&mut assets);
+        let reqs = snap.collect_tex_requests();
+        let atlas = build_texture_atlas(&reqs, &assets, 8);
+        let rect = atlas
+            .rects
+            .get(&TexRequestKey {
+                tex_ref: snapshot_tex_ref("tex_0000"),
+                tint_rgb: Some([128, 255, 64]),
+            })
+            .expect("tinted snapshot tile must exist in atlas");
+        let px_x = ((rect.u_min + rect.u_max) * 0.5 * atlas.width as f32) as u32;
+        let px_y = ((1.0 - (rect.v_top + rect.v_bot) * 0.5) * atlas.height as f32) as u32;
+        let px = atlas.image.get_pixel(px_x.min(atlas.width - 1), px_y.min(atlas.height - 1));
+        assert!(px[0] < 120 && px[1] > 140 && px[2] < 50, "Expected non-grayscale snapshot tint applied, got {:?}", px);
+
+        let origin = [10.0, 60.0, -5.0];
+        let scale = 48.0;
+        let grid = VoxelGrid {
+            coords,
+            palette: vec![make_state("unknownmod:leaf", &[])],
+            air_id: 255,
+            blocks: vec![0],
+            biome_palette: vec!["minecraft:plains".to_string()],
+            biomes: vec![0],
+            signs: HashMap::new(),
+            player_spawn_mc: None,
+        };
+        let models = vec![ResolvedBlockModel::Empty];
+        let (feat, _) = extract_features_and_requests(&grid, &models, origin, scale);
+        let sign_atlas = SignAtlas { image: ImageBuffer::new(16, 16), rects: HashMap::new() };
+        let _ = FontRenderer::from_assets(&assets);
+        let chunks: Vec<crate::mesher::ChunkMesh> = stream_world_chunks_with_snapshot(
+            &grid, &models, &atlas, &sign_atlas, &feat, Some(&snap), origin, scale, 16, &HashMap::new(), Ok
+        )
+        .unwrap();
+        let tri = &chunks[0].solid_tris[0];
+        // v0 = (12+0.1, 62+0.2, -3+0.3) relative to (10, 60, -5) = (2.1, 2.2, 2.3) -> source (2.1*48, -2.3*48, 2.2*48)
+        assert!((tri.pos[0][0] - (2.1 * 48.0) as f32).abs() < 1e-2);
+        assert!((tri.pos[0][1] - (-2.3 * 48.0) as f32).abs() < 1e-2);
+        assert!((tri.pos[0][2] - (2.2 * 48.0) as f32).abs() < 1e-2);
+        // Normal [0.0, 0.6, 0.8] -> mc_normal_to_source -> [0.0, -0.8, 0.6]
+        assert!((tri.norm[0][0] - 0.0).abs() < 1e-4);
+        assert!((tri.norm[0][1] - (-0.8)).abs() < 1e-4);
+        assert!((tri.norm[0][2] - 0.6).abs() < 1e-4);
+
+        // CLI -> GUI launch config -> PipelineOptions plumbing check
+        let argv = [
+            "mcgm",
+            "--gui",
+            "--coords", "12", "62", "-3", "12", "62", "-3",
+            "--mod-snapshot", snap_dir.to_str().unwrap(),
+        ];
+        let matches = CliArgs::command().try_get_matches_from(argv).unwrap();
+        let args = CliArgs::from_arg_matches(&matches).unwrap();
+        let cfg = crate::build_gui_launch_config(&args, &matches);
+        assert_eq!(cfg.mod_snapshot.as_deref(), Some(snap_dir.as_path()));
+        let opts = resolve_gui_pipeline_options(None, &cfg);
+        assert_eq!(opts.mod_snapshot.as_deref(), Some(snap_dir.as_path()));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

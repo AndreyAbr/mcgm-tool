@@ -199,7 +199,6 @@ struct RawFace {
 }
 
 enum AssetLoc {
-    #[cfg(test)]
     Inline(Arc<[u8]>),
     Zip { source_idx: usize, entry_idx: usize },
     File(PathBuf),
@@ -447,12 +446,16 @@ impl AssetIndex {
         }
     }
 
-    #[cfg(test)]
-    pub fn insert_entry(&mut self, path: &str, data: Vec<u8>) {
+    pub fn register_snapshot_texture(&mut self, key: &str, data: Vec<u8>) {
         self.entries.insert(
-            path.replace('\\', "/").to_lowercase(),
+            key.replace('\\', "/").to_lowercase(),
             AssetLoc::Inline(Arc::from(data)),
         );
+    }
+
+    #[cfg(test)]
+    pub fn insert_entry(&mut self, path: &str, data: Vec<u8>) {
+        self.register_snapshot_texture(path, data);
     }
 
     fn decode_png(&self, path: &str) -> Option<RgbaImage> {
@@ -477,7 +480,6 @@ impl AssetIndex {
             std::borrow::Cow::Borrowed(key)
         };
         let loc = self.entries.get(lower.as_ref())?;
-        #[cfg(test)]
         if let AssetLoc::Inline(arc) = loc {
             return Some(Arc::clone(arc));
         }
@@ -487,7 +489,6 @@ impl AssetIndex {
             }
         }
         let loaded: Arc<[u8]> = match loc {
-            #[cfg(test)]
             AssetLoc::Inline(arc) => Arc::clone(arc),
             AssetLoc::File(p) => {
                 const MAX_ASSET_BYTES: usize = 64 * 1024 * 1024;
@@ -518,6 +519,9 @@ impl AssetIndex {
     }
 
     fn resolve_texture_bytes(&self, tex_ref: &str) -> Option<(String, Arc<[u8]>)> {
+        if tex_ref.starts_with(crate::snapshot::SNAPSHOT_TEX_PREFIX) {
+            return self.get_bytes(tex_ref).map(|b| (tex_ref.to_string(), b));
+        }
         let (ns, rel) = split_namespaced(tex_ref);
         let rel_trimmed = rel.trim_start_matches('/');
         let rel_no_tex = rel_trimmed.strip_prefix("textures/").unwrap_or(rel_trimmed);

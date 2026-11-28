@@ -1176,6 +1176,17 @@ pub fn build_world_collision_with_models(
     scale: f64,
     chunk_size: usize,
 ) -> WorldCollisionResult {
+    build_world_collision_with_snapshot(grid, resolved_models, None, origin_mc, scale, chunk_size)
+}
+
+pub fn build_world_collision_with_snapshot(
+    grid: &VoxelGrid,
+    resolved_models: Option<&[crate::assets::ResolvedBlockModel]>,
+    snapshot: Option<&crate::snapshot::LoadedModSnapshot>,
+    origin_mc: [f64; 3],
+    scale: f64,
+    chunk_size: usize,
+) -> WorldCollisionResult {
     let chunk_size = chunk_size.max(1);
     let c = grid.coords;
     let sx = c.size_x();
@@ -1427,6 +1438,26 @@ pub fn build_world_collision_with_models(
         })
         .collect();
 
+    // Build sparse bitset of snapshot-covered voxels in O(|covered|)
+    let mut snapshot_covered_bits: Vec<u64> = Vec::new();
+    let mut any_snapshot_covered = false;
+    if let Some(snap) = snapshot {
+        if !snap.blocks_by_pos.is_empty() && total_voxels > 0 {
+            snapshot_covered_bits.resize(total_voxels.div_ceil(64), 0);
+            for &(wx, wy, wz) in snap.blocks_by_pos.keys() {
+                if snap.is_covered_block(wx, wy, wz) {
+                    if let Some(idx) = grid.index(wx, wy, wz) {
+                        snapshot_covered_bits[idx >> 6] |= 1u64 << (idx & 63);
+                        any_snapshot_covered = true;
+                    }
+                }
+            }
+        }
+    }
+    let is_snap_idx = |idx: usize| -> bool {
+        any_snapshot_covered && ((snapshot_covered_bits[idx >> 6] >> (idx & 63)) & 1) != 0
+    };
+
     // 1. Build compact 1-byte/voxel flags array in parallel
     let mut flags = vec![0u8; total_voxels];
     let slice_sz = sx * sz;
@@ -1435,8 +1466,23 @@ pub fn build_world_collision_with_models(
             .par_chunks_mut(slice_sz)
             .enumerate()
             .for_each(|(gy, dst_slice)| {
-                let src_slice = &grid.blocks[gy * slice_sz..(gy + 1) * slice_sz];
+                let y_base = gy * slice_sz;
+                let src_slice = &grid.blocks[y_base..(gy + 1) * slice_sz];
+                let wy = c.min_y + gy as i32;
                 for i in 0..slice_sz {
+                    if is_snap_idx(y_base + i) {
+                        if let Some(snap) = snapshot {
+                            let gz = i / sx;
+                            let gx = i % sx;
+                            let wx = c.min_x + gx as i32;
+                            let wz = c.min_z + gz as i32;
+                            let has_col = snap
+                                .covered_block(wx, wy, wz)
+                                .is_some_and(|b| b.has_collision && !b.collision_boxes.is_empty());
+                            dst_slice[i] = if has_col { 0 } else { FLAG_PASSABLE };
+                            continue;
+                        }
+                    }
                     let m = &pal_meta[src_slice[i] as usize];
                     let mut f = 0u8;
                     match m.solid_class {
@@ -1611,7 +1657,11 @@ pub fn build_world_collision_with_models(
                         let gz = z0 + lz;
                         let row = (gy * sz + gz) * sx + x0;
                         for lx in 0..cw {
-                            let l = pal_meta[grid.blocks[row + lx] as usize].snow_layers;
+                            let v_idx = row + lx;
+                            if is_snap_idx(v_idx) {
+                                continue;
+                            }
+                            let l = pal_meta[grid.blocks[v_idx] as usize].snow_layers;
                             if (2..=8).contains(&l) {
                                 let li = (l - 2) as usize;
                                 if layer_masks[li].is_empty() {
@@ -1664,7 +1714,11 @@ pub fn build_world_collision_with_models(
                         let gz = z0 + lz;
                         let row = (gy * sz + gz) * sx + x0;
                         for lx in 0..cw {
-                            let m = &pal_meta[grid.blocks[row + lx] as usize];
+                            let v_idx = row + lx;
+                            if is_snap_idx(v_idx) {
+                                continue;
+                            }
+                            let m = &pal_meta[grid.blocks[v_idx] as usize];
                             let kind_idx = m.slab_kind;
                             if kind_idx < 3 {
                                 let sp_i = m.surface_prop as usize;
@@ -1717,7 +1771,11 @@ pub fn build_world_collision_with_models(
                         let gz = z0 + lz;
                         let row = (gy * sz + gz) * sx + x0;
                         for lx in 0..cw {
-                            let m = &pal_meta[grid.blocks[row + lx] as usize];
+                            let v_idx = row + lx;
+                            if is_snap_idx(v_idx) {
+                                continue;
+                            }
+                            let m = &pal_meta[grid.blocks[v_idx] as usize];
                             if let Some((top_u, facing_u)) = m.stair_info {
                                 let sp_i = m.surface_prop as usize;
                                 let top = top_u as usize;
@@ -1868,7 +1926,11 @@ pub fn build_world_collision_with_models(
                             let gz = z0 + lz;
                             let row = (gy * sz + gz) * sx + x0;
                             for lx in 0..cw {
-                                let m = &pal_meta[grid.blocks[row + lx] as usize];
+                                let v_idx = row + lx;
+                                if is_snap_idx(v_idx) {
+                                    continue;
+                                }
+                                let m = &pal_meta[grid.blocks[v_idx] as usize];
                                 if m.wall_fence_kind != target_kind || m.surface_prop != sp {
                                     continue;
                                 }
@@ -2049,8 +2111,8 @@ pub fn build_world_collision_with_models(
                 }
             }
 
-            // Unmerged partial boxes & hazards inside this chunk
-            if any_partial || any_hazard {
+            // Unmerged partial boxes, snapshot collision boxes & hazards inside this chunk
+            if any_partial || any_hazard || any_snapshot_covered {
                 for gy in 0..sy {
                     let wy = c.min_y + gy as i32;
                     for lz in 0..cd {
@@ -2060,7 +2122,33 @@ pub fn build_world_collision_with_models(
                         for lx in 0..cw {
                             let gx = x0 + lx;
                             let wx = c.min_x + gx as i32;
-                            let m = &pal_meta[grid.blocks[row + lx] as usize];
+                            let v_idx = row + lx;
+                            let m = &pal_meta[grid.blocks[v_idx] as usize];
+                            if is_snap_idx(v_idx) {
+                                if let Some(entry) = snapshot.and_then(|s| s.covered_block(wx, wy, wz)) {
+                                    if entry.has_collision && !entry.collision_boxes.is_empty() {
+                                        let walkable = is_top_walkable(gx, gx + 1, gy + 1, gz, gz + 1);
+                                        for &local in &entry.collision_boxes {
+                                            let sb = mc_box_to_source(
+                                                wx as f64,
+                                                wy as f64,
+                                                wz as f64,
+                                                local,
+                                                origin_mc,
+                                                scale,
+                                            );
+                                            boxes.push(CollisionBox {
+                                                box_coords: sb,
+                                                block_class: Cow::Borrowed("partial"),
+                                                is_walkable: walkable,
+                                                is_opaque_roof: false,
+                                                surface_prop: m.surface_prop,
+                                            });
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
                             if m.is_unmerged_partial {
                                 let walkable = is_top_walkable(gx, gx + 1, gy + 1, gz, gz + 1);
                                 for &(local, bclass, is_roof) in &m.unmerged_boxes {
@@ -2350,9 +2438,11 @@ pub fn build_world_collision_with_models(
             mask.par_chunks_mut(slice_sz)
                 .enumerate()
                 .for_each(|(gy, dst)| {
-                    let src = &grid.blocks[gy * slice_sz..(gy + 1) * slice_sz];
+                    let y_base = gy * slice_sz;
+                    let src = &grid.blocks[y_base..(gy + 1) * slice_sz];
                     for i in 0..slice_sz {
-                        dst[i] = pal_meta[src[i] as usize].zone_kind_idx as usize == z_idx;
+                        dst[i] = !is_snap_idx(y_base + i)
+                            && pal_meta[src[i] as usize].zone_kind_idx as usize == z_idx;
                     }
                 });
         }
@@ -2468,7 +2558,11 @@ pub fn build_world_collision_with_models(
                         let src_row = (gy * sz + gz) * sx;
                         let dst_row = gy * sx;
                         for gx in 0..sx {
-                            let m = &pal_meta[grid.blocks[src_row + gx] as usize];
+                            let v_idx = src_row + gx;
+                            if is_snap_idx(v_idx) {
+                                continue;
+                            }
+                            let m = &pal_meta[grid.blocks[v_idx] as usize];
                             for side in 0..2u8 {
                                 if !z_masks[side as usize].is_empty() && match_fn(m, side) {
                                     z_masks[side as usize][dst_row + gx] = true;
@@ -2508,7 +2602,11 @@ pub fn build_world_collision_with_models(
                     for gy in 0..sy {
                         let dst_row = gy * sz;
                         for gz in 0..sz {
-                            let m = &pal_meta[grid.blocks[(gy * sz + gz) * sx + gx] as usize];
+                            let v_idx = (gy * sz + gz) * sx + gx;
+                            if is_snap_idx(v_idx) {
+                                continue;
+                            }
+                            let m = &pal_meta[grid.blocks[v_idx] as usize];
                             for idx in 0..2usize {
                                 let side = (idx + 2) as u8;
                                 if !x_masks[idx].is_empty() && match_fn(m, side) {

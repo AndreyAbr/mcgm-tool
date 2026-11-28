@@ -14,6 +14,7 @@ mod instances;
 mod mesher;
 mod skybox;
 mod smd_writer;
+mod snapshot;
 mod vmf_builder;
 
 #[cfg(test)]
@@ -27,7 +28,7 @@ use crate::atlas::{
     save_atlas_cache_meta, FontRenderer,
 };
 use crate::cli::CliArgs;
-use crate::collision::build_world_collision_with_models;
+use crate::collision::build_world_collision_with_snapshot;
 use crate::compiler::{
     compile_bsp_map_cancellable, compile_chunk_models_cached, detect_minecraft_saves,
     detect_tools_and_save, load_tool_paths, run_env_check,
@@ -37,7 +38,7 @@ use crate::glua::{install_mc_physics_files, install_parkour_marker_files};
 use crate::gui::{run_gui_with_config, GuiLaunchConfig, UiLang};
 use crate::mesher::{
     compute_world_origin_mc, extract_features_and_requests, extract_parkour_markers,
-    mc_point_to_source, stream_world_chunks_with_animated,
+    mc_point_to_source, stream_world_chunks_with_snapshot,
 };
 use crate::skybox::generate_minecraft_skybox;
 use crate::smd_writer::emit_chunk_smds_and_qcs;
@@ -73,6 +74,7 @@ pub struct PipelineOptions {
     pub reuse_cache: bool,
     pub cancel_flag: Option<Arc<AtomicBool>>,
     pub debug_log: Option<PathBuf>,
+    pub mod_snapshot: Option<PathBuf>,
 }
 
 impl Default for PipelineOptions {
@@ -107,6 +109,7 @@ impl Default for PipelineOptions {
             reuse_cache: false,
             cancel_flag: None,
             debug_log: None,
+            mod_snapshot: None,
         }
     }
 }
@@ -190,6 +193,7 @@ pub struct PipelineSummary {
     pub door_count: usize,
     pub total_secs: f64,
     pub stage_timings: Vec<(String, f64)>,
+    pub mod_snapshot_report: Option<crate::snapshot::SnapshotApplyReport>,
 }
 
 impl PipelineSummary {
@@ -212,7 +216,7 @@ impl PipelineSummary {
     }
 
     pub fn format_cli_report(&self) -> String {
-        match (&self.outcome_status(), &self.gma_error) {
+        let base = match (&self.outcome_status(), &self.gma_error) {
             (ExportOutcomeStatus::PartialSuccess, Some(err)) => format!(
                 "Export partially complete (PARTIAL_SUCCESS): BSP ready at {}, but creating new GMA addon failed: {}",
                 self.bsp_path.display(),
@@ -225,6 +229,11 @@ impl PipelineSummary {
             (ExportOutcomeStatus::Success, _) => {
                 format!("Export complete: {}", self.bsp_path.display())
             }
+        };
+        if let Some(ref rep) = self.mod_snapshot_report {
+            format!("{}\n{}", base, rep.format_log_line())
+        } else {
+            base
         }
     }
 }
@@ -450,11 +459,27 @@ pub fn run_export_pipeline(
     check_cancel()?;
     emit!(1, "Parsing Minecraft Anvil regions and indexing JAR assets...");
     let t0 = Instant::now();
-    let (grid_res, assets) = rayon::join(
+    let (grid_res, mut assets) = rayon::join(
         || load_world_region(&opts.world_dir, &opts.dimension, opts.coords, eff_scale),
         || AssetIndex::discover_and_load(tools.vanilla_jar.as_deref(), Some(&opts.world_dir), &[]),
     );
     let grid = grid_res?;
+    let mod_snapshot = if let Some(ref snap_path) = opts.mod_snapshot {
+        let snap = crate::snapshot::LoadedModSnapshot::load_and_validate(
+            snap_path,
+            &grid.coords,
+            &opts.dimension,
+        )?;
+        snap.register_textures(&mut assets);
+        let snap_line = snap.report.format_log_line();
+        emit!(5, &snap_line);
+        for sample in &snap.report.partial_or_fallback_samples {
+            emit!(5, &format!("Snapshot detail: {}", sample));
+        }
+        Some(snap)
+    } else {
+        None
+    };
     let dt_anvil = t0.elapsed().as_secs_f64();
     timings.push(("Anvil Parse".to_string(), dt_anvil));
     emit!(
@@ -482,8 +507,17 @@ pub fn run_export_pipeline(
         .collect();
     let origin_mc = compute_world_origin_mc(&grid);
     let parkour_markers = extract_parkour_markers(&grid, origin_mc, eff_scale);
-    let (mut features, tex_requests) =
+    let (mut features, mut tex_requests) =
         extract_features_and_requests(&grid, &resolved_models, origin_mc, eff_scale);
+    if let Some(ref snap) = mod_snapshot {
+        let mut seen: std::collections::HashSet<crate::atlas::TexRequestKey> =
+            tex_requests.iter().cloned().collect();
+        for tk in snap.collect_tex_requests() {
+            if seen.insert(tk.clone()) {
+                tex_requests.push(tk);
+            }
+        }
+    }
     let dt_assets = t1.elapsed().as_secs_f64();
     timings.push(("Assets & Models".to_string(), dt_assets));
     emit!(
@@ -610,8 +644,14 @@ pub fn run_export_pipeline(
         )
     );
     let t3 = Instant::now();
-    let mut col_res =
-        build_world_collision_with_models(&grid, Some(&resolved_models), origin_mc, eff_scale, eff_chunk_size);
+    let mut col_res = build_world_collision_with_snapshot(
+        &grid,
+        Some(&resolved_models),
+        mod_snapshot.as_ref(),
+        origin_mc,
+        eff_scale,
+        eff_chunk_size,
+    );
     let dt_col = t3.elapsed().as_secs_f64();
     timings.push(("Greedy Collision".to_string(), dt_col));
     emit!(
@@ -642,12 +682,13 @@ pub fn run_export_pipeline(
     let total_tris_written = AtomicU64::new(0);
     let mesh_prog_gate = Mutex::new((Instant::now(), 0usize));
 
-    let streamed = stream_world_chunks_with_animated(
+    let streamed = stream_world_chunks_with_snapshot(
         &grid,
         &resolved_models,
         &atlas,
         &sign_atlas,
         &features,
+        mod_snapshot.as_ref(),
         origin_mc,
         eff_scale,
         eff_chunk_size,
@@ -1198,6 +1239,7 @@ pub fn run_export_pipeline(
         door_count,
         total_secs,
         stage_timings: timings.clone(),
+        mod_snapshot_report: mod_snapshot.as_ref().map(|s| s.report.clone()),
     };
     let status_line = summary.status_log_line();
     emit!(
@@ -1344,6 +1386,7 @@ pub fn build_gui_launch_config(args: &CliArgs, matches: &clap::ArgMatches) -> Gu
         max_convex: args.max_convex,
         reuse_cache: reuse_opt,
         debug_log: args.debug_log.clone(),
+        mod_snapshot: args.mod_snapshot.clone(),
         startup_error,
         auto_start,
         lang: lang_opt,
@@ -1625,6 +1668,7 @@ fn main() {
         reuse_cache: args.effective_reuse_cache(),
         cancel_flag: None,
         debug_log: args.debug_log.clone(),
+        mod_snapshot: args.mod_snapshot.clone(),
     };
 
     match run_export_pipeline(opts, |_, _| {}) {

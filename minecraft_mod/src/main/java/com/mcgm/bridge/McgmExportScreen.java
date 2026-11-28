@@ -22,6 +22,7 @@ public class McgmExportScreen extends Screen {
     private static boolean hqLight = false;
     private static boolean importGMod = true;
     private static boolean exportVmf = false;
+    private static boolean captureModSnapshot = false;
     private static String dimensionMode = "auto"; // "auto", "overworld", "nether", "end"
     private static String worldOverride = "";
 
@@ -36,6 +37,7 @@ public class McgmExportScreen extends Screen {
             hqLight = loaded.hqLight;
             importGMod = loaded.importGMod;
             exportVmf = loaded.exportVmf;
+            captureModSnapshot = loaded.captureModSnapshot;
             dimensionMode = loaded.dimensionMode;
             worldOverride = loaded.worldOverride;
             settingsLoaded = true;
@@ -57,6 +59,7 @@ public class McgmExportScreen extends Screen {
         s.hqLight = hqLight;
         s.importGMod = importGMod;
         s.exportVmf = exportVmf;
+        s.captureModSnapshot = captureModSnapshot;
         s.dimensionMode = dimensionMode;
         s.worldOverride = worldOverride != null ? worldOverride : "";
         Exporter.saveScreenSettings(this.client, s);
@@ -166,6 +169,7 @@ public class McgmExportScreen extends Screen {
     private CheckboxWidget cbHqLight;
     private CheckboxWidget cbImportGMod;
     private CheckboxWidget cbExportVmf;
+    private CheckboxWidget cbModSnapshot;
 
     private String statusError = "";
     private String mcgmPathDraft = null;
@@ -199,6 +203,7 @@ public class McgmExportScreen extends Screen {
         if (cbHqLight != null) hqLight = cbHqLight.isChecked();
         if (cbImportGMod != null) importGMod = cbImportGMod.isChecked();
         if (cbExportVmf != null) exportVmf = cbExportVmf.isChecked();
+        if (cbModSnapshot != null) captureModSnapshot = cbModSnapshot.isChecked();
     }
 
     @Override
@@ -210,7 +215,7 @@ public class McgmExportScreen extends Screen {
         }
         super.init();
 
-        this.topOffset = (this.height > 256) ? Math.min(20, (this.height - 240) / 6) : 0;
+        this.topOffset = (this.height > 256) ? Math.min(14, Math.max(0, (this.height - 248) / 6)) : 0;
         int centerX = this.width / 2;
         boolean isRu = "ru".equals(getEffectiveLanguage());
 
@@ -350,21 +355,30 @@ public class McgmExportScreen extends Screen {
         // Row 6: Checkboxes row 2
         int y6 = topOffset + 138;
         cbImportGMod = new CheckboxWidget(
-            centerX - 190, y6, 185, 20,
+            centerX - 190, y6, 185, 18,
             Text.literal(isRu ? "Импорт в GMod" : "Import to GMod"),
             importGMod
         );
         this.addDrawableChild(cbImportGMod);
 
         cbExportVmf = new CheckboxWidget(
-            centerX + 5, y6, 180, 20,
+            centerX + 5, y6, 180, 18,
             Text.literal(isRu ? "Экспорт VMF" : "Export Hammer VMF"),
             exportVmf
         );
         this.addDrawableChild(cbExportVmf);
 
+        // Row 6b: Universal modded block client snapshot
+        int y6b = topOffset + 157;
+        cbModSnapshot = new CheckboxWidget(
+            centerX - 190, y6b, 375, 18,
+            Text.literal(isRu ? "Снимок модовых блоков" : "Modded block snapshot"),
+            captureModSnapshot
+        );
+        this.addDrawableChild(cbModSnapshot);
+
         // Row 7: mcgm.exe Path & World Override (for multiplayer / custom local save)
-        int y7 = topOffset + 171;
+        int y7 = topOffset + 188;
         fieldMcgmPath = new TextFieldWidget(this.textRenderer, centerX - 190, y7, 185, 18, Text.literal("mcgm.exe Path"));
         fieldMcgmPath.setMaxLength(512);
         fieldMcgmPath.setText(mcgmPathDraft != null ? mcgmPathDraft : Exporter.getOrResolveMcgmPath(this.client));
@@ -379,7 +393,7 @@ public class McgmExportScreen extends Screen {
         this.addDrawableChild(fieldWorldOverride);
 
         // Row 9: Action buttons
-        int y9 = topOffset + 204;
+        int y9 = topOffset + 221;
         btnExport = ButtonWidget.builder(
             Text.literal(isRu ? "Экспорт в GMod" : "Export to GMod"),
             b -> onExportClicked()
@@ -410,6 +424,7 @@ public class McgmExportScreen extends Screen {
         if (cbHqLight != null) cbHqLight.setMessage(Text.literal(isRu ? "HQ свет (медленно)" : "HQ Lighting (Slow)"));
         if (cbImportGMod != null) cbImportGMod.setMessage(Text.literal(isRu ? "Импорт в GMod" : "Import to GMod"));
         if (cbExportVmf != null) cbExportVmf.setMessage(Text.literal(isRu ? "Экспорт VMF" : "Export Hammer VMF"));
+        if (cbModSnapshot != null) cbModSnapshot.setMessage(Text.literal(isRu ? "Снимок модовых блоков" : "Modded block snapshot"));
         if (fieldWorldOverride != null) {
             fieldWorldOverride.setPlaceholder(Text.literal(isRu ? "Авто (одиночный мир)" : "Auto (Active SP)"));
         }
@@ -531,6 +546,7 @@ public class McgmExportScreen extends Screen {
             hqLight,
             importGMod,
             exportVmf,
+            captureModSnapshot,
             dimensionMode,
             worldOverride,
             customPath,
@@ -588,6 +604,7 @@ public class McgmExportScreen extends Screen {
             lightingStyle,
             mcPhysics,
             hqLight,
+            captureModSnapshot,
             dimensionMode,
             worldOverride,
             customPath,
@@ -632,7 +649,7 @@ public class McgmExportScreen extends Screen {
         context.drawTextWithShadow(
             this.textRenderer,
             Text.literal(isRu ? "Путь к mcgm.exe:" : "Path to mcgm.exe:"),
-            centerX - 190, topOffset + 161, 0xCCCCCC
+            centerX - 190, topOffset + 178, 0xCCCCCC
         );
 
         boolean remoteMp = Exporter.isRemoteMultiplayer(this.client);
@@ -641,20 +658,20 @@ public class McgmExportScreen extends Screen {
             context.drawTextWithShadow(
                 this.textRenderer,
                 Text.literal(isRu ? "MP: Укажите путь к миру!" : "MP: Local world path required!"),
-                centerX + 5, topOffset + 161, 0xFF6666
+                centerX + 5, topOffset + 178, 0xFF6666
             );
         } else {
             context.drawTextWithShadow(
                 this.textRenderer,
                 Text.literal(isRu ? "Путь к миру (MP):" : "World Override (MP):"),
-                centerX + 5, topOffset + 161, 0xCCCCCC
+                centerX + 5, topOffset + 178, 0xCCCCCC
             );
         }
 
         // Dynamic volume / error / warning line
         if (statusError != null && !statusError.isEmpty()) {
             String clippedErr = this.textRenderer.trimToWidth(statusError, 375);
-            context.drawCenteredTextWithShadow(this.textRenderer, Text.literal(clippedErr), centerX, topOffset + 192, 0xFF5555);
+            context.drawCenteredTextWithShadow(this.textRenderer, Text.literal(clippedErr), centerX, topOffset + 209, 0xFF5555);
         } else {
             int x1 = parseCoord(fieldMinX.getText(), 0);
             int y1 = parseCoord(fieldMinY.getText(), 0);
@@ -676,7 +693,7 @@ public class McgmExportScreen extends Screen {
                 volStr += isRu ? " [MP: укажите мир]" : " [MP: set world path]";
                 color = 0xFFAA00;
             }
-            context.drawCenteredTextWithShadow(this.textRenderer, Text.literal(volStr), centerX, topOffset + 192, color);
+            context.drawCenteredTextWithShadow(this.textRenderer, Text.literal(volStr), centerX, topOffset + 209, color);
         }
 
         super.render(context, mouseX, mouseY, delta);
